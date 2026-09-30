@@ -60,6 +60,7 @@ async def execute(
     from screener.pipeline.gate import fetch
 
     now = clock.now()
+    outbox = Path(cfg.screener_outbox)
     run_id = repo.begin_run(
         now, cfg.config_hash(), "weekly" if cfg.screener_mode == "weekly" else "daily"
     )
@@ -77,7 +78,7 @@ async def execute(
             stats.stage_counts["fetched"] = len(papers)
 
             # --- retry a previously unsent digest first (§9) --------------------------
-            unsent = pending_outbox()
+            unsent = pending_outbox(outbox)
             if unsent is not None and not cfg.dry_run:
                 await _retry_outbox(unsent, notifier, heartbeat)
 
@@ -123,6 +124,13 @@ async def execute(
                         ledger=ledger,
                         stats=stats,
                     )
+                    # Persist the *prose* as well as the scores. `rankings` holds the score
+                    # breakdown but no review text, so without this the summaries exist only in
+                    # the delivered message: replay could not rebuild a digest, and the audit
+                    # trail §6.5 promises would have nothing to explain. A Ranking carries its
+                    # Assessment by construction, so this needs no extra plumbing.
+                    for r in ranked:
+                        repo.save_assessment(run_id, r.assessment)
                     repo.save_rankings(run_id, ranked)
                     stats.stage_counts["ranked"] = len(ranked)
                     stats.stage_counts["review_failures"] = failures
@@ -158,7 +166,9 @@ async def execute(
 
                     # --- 6. deliver ---------------------------------------------------
                     try:
-                        ids = await deliver(notifier, digest, now=now, dry_run=cfg.dry_run)
+                        ids = await deliver(
+                            notifier, digest, now=now, dry_run=cfg.dry_run, outbox=outbox
+                        )
                         repo.record_delivery(
                             run_id, picks, "digest", digest.message_map([str(i) for i in ids])
                         )

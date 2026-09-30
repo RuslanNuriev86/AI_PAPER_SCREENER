@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -567,3 +568,189 @@ async def test_revisit_records_a_probe_outage_instead_of_crashing(repo) -> None:
     assert result.due == 1
     assert result.measured == 0
     assert result.per_source_errors
+
+
+async def test_the_configured_outbox_is_used_not_the_working_directory(repo, tmp_path) -> None:
+    """The outbox path comes from config.
+
+    Without this, a pipeline test resolved `./outbox` relative to the repo and consumed a real
+    stranded digest. Isolation is not a nicety here; it lost data once.
+    """
+    cfg = _settings()
+    cfg.screener_outbox = str(tmp_path / "custom-outbox")
+    run = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource([make_paper()]),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(fail=True),
+        heartbeat=FakeHeartbeat(),
+    )
+    assert run.status == "degraded"
+    written = list((tmp_path / "custom-outbox").glob("*"))
+    assert written, "the undeliverable digest must land in the configured outbox"
+    assert not Path("outbox").exists() or not list(Path("outbox").glob("*.html"))
+
+
+async def test_a_stranded_digest_is_retried_and_retired(repo, tmp_path) -> None:
+    """The recovery path end to end: park a digest, then let the next run deliver it."""
+    from screener.pipeline.deliver import load_outbox, pending_outbox
+
+    cfg = _settings()
+    cfg.screener_outbox = str(tmp_path / "outbox")
+    outbox = tmp_path / "outbox"
+
+    first = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource([make_paper()]),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(fail=True),
+        heartbeat=FakeHeartbeat(),
+    )
+    assert first.status == "degraded"
+    parked = pending_outbox(outbox)
+    assert parked is not None, "the failed digest must be parked"
+    chunks, _ = load_outbox(parked)
+    assert chunks and any("Agent Papers" in c for c in chunks)
+
+    # Next run: Telegram works again. The paper is already seen, so nothing fresh — but the
+    # parked digest must still be delivered.
+    notifier = FakeNotifier()
+    second = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource([make_paper()]),
+        llm=GoodLLM(score=8.0),
+        notifier=notifier,
+        heartbeat=FakeHeartbeat(),
+    )
+    assert second.status == "empty"
+    assert notifier.sent, "the parked digest should have been re-sent"
+    assert pending_outbox(outbox) is None, "and retired once delivered"
+
+
+async def test_review_prose_is_persisted_so_a_digest_can_be_rebuilt(repo) -> None:
+    """The bug this catches: `save_assessment` was never called.
+
+    `rankings` stores the score breakdown but no review text, so without an `assessments` row the
+    summaries exist only in the delivered message. Replay then rebuilds nothing, and §6.5's
+    audit trail has nothing to explain — which is exactly what happened on the first real
+    digest, where recovery was impossible.
+    """
+    from screener.pipeline.replay import replay_run
+
+    cfg = _settings()
+    # replay opens its own connection, so it must be pointed at the fixture's file rather than
+    # the in-memory default.
+    cfg.screener_db = repo.path
+    await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(3)),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(),
+        heartbeat=FakeHeartbeat(),
+    )
+
+    stored = repo._conn.execute("SELECT COUNT(*) c FROM assessments").fetchone()["c"]
+    assert stored > 0, "the review prose must be persisted, not just the scores"
+
+    result = replay_run(cfg, NOW.date().isoformat())
+    assert result.ranked, "replay must be able to rebuild the digest from stored data"
+    rebuilt = result.ranked[0].review
+    assert rebuilt.tldr, "the review text must survive the round trip"
+    assert rebuilt.scores.impact_forecast is not None
+
+
+async def test_rearm_makes_only_the_shortlisted_papers_fresh_again(repo) -> None:
+    """Recovery for a reviewed-but-undelivered digest whose outbox entry was lost."""
+    from screener.pipeline.replay import rearm
+
+    cfg = _settings()
+    cfg.screener_db = repo.path
+    cfg.screener_review_top_k = 2
+    # The scenario this command exists for: reviewed and paid for, but the send failed, so no
+    # delivery row exists and `dedupe_revisions` will not block the papers.
+    await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(5)),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(fail=True),
+        heartbeat=FakeHeartbeat(),
+    )
+    deliveries = repo._conn.execute("SELECT COUNT(*) c FROM deliveries").fetchone()["c"]
+    assert deliveries == 0, "the scenario requires an undelivered digest"
+    seen_before = repo._conn.execute("SELECT COUNT(*) c FROM gate_results").fetchone()["c"]
+    assert seen_before == 5
+
+    ids = rearm(cfg, NOW.date().isoformat())
+    assert len(ids) == 2, "only the reviewed papers should be re-armed, not the whole window"
+
+    seen_after = repo._conn.execute("SELECT COUNT(*) c FROM gate_results").fetchone()["c"]
+    assert seen_after == 3, "the un-reviewed papers stay seen, so this is cheap to recover"
+
+    # And the next run finds them fresh again.
+    run = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(5)),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(),
+        heartbeat=FakeHeartbeat(),
+    )
+    assert run.stats.stage_counts["fresh"] == 2
+    assert run.status == "ok"
+
+
+def test_rearm_on_an_unknown_date_is_a_no_op(repo) -> None:
+    from screener.pipeline.replay import rearm
+
+    cfg = _settings()
+    cfg.screener_db = repo.path
+    assert rearm(cfg, "1999-01-01") == []
+
+
+async def test_rearm_does_not_resurrect_a_paper_that_was_actually_sent(repo) -> None:
+    """Recovery must not break at-most-once: a delivered paper stays delivered.
+
+    `dedupe_revisions` blocks re-processing anything with a real `message_id`, and that check
+    must survive `rearm` — otherwise "recover a failed digest" would become "re-send things the
+    reader already has".
+    """
+    from screener.pipeline.replay import rearm
+
+    cfg = _settings()
+    cfg.screener_db = repo.path
+    cfg.screener_review_top_k = 2
+    await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(5)),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(),
+        heartbeat=FakeHeartbeat(),
+    )
+    assert repo._conn.execute("SELECT COUNT(*) c FROM deliveries").fetchone()["c"] > 0
+
+    rearm(cfg, NOW.date().isoformat())
+    run = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(5)),
+        llm=GoodLLM(score=8.0),
+        notifier=FakeNotifier(),
+        heartbeat=FakeHeartbeat(),
+    )
+    assert run.stats.stage_counts["fresh"] == 0, (
+        "papers with a real message_id must not be re-reviewed or re-sent"
+    )

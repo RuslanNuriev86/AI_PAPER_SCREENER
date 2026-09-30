@@ -11,6 +11,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -99,7 +100,7 @@ async def run_doctor(cfg: Settings, *, config_dir: str | Path = CONFIG_DIR) -> R
     r.add(
         OK if cfg.llm_api_key else FAIL,
         "LLM credential",
-        "DEEPSEEK_API_KEY set"
+        "DEEPSEEK_API_KEY present"
         if cfg.llm_api_key
         else "missing DEEPSEEK_API_KEY (or LLM_API_KEY): a live run cannot score anything",
     )
@@ -112,8 +113,12 @@ async def run_doctor(cfg: Settings, *, config_dir: str | Path = CONFIG_DIR) -> R
     )
     if cfg.telegram_bot_token and cfg.telegram_chat_id:
         r.add(OK, "telegram config", "token + chat id present")
-    else:
+    elif not cfg.telegram_bot_token:
         r.add(FAIL, "telegram config", "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID required")
+    else:
+        # Token but no chat id: the id is not something you can look up, it is whatever
+        # Telegram reports once the bot has received something. So fetch it and print it.
+        r.add(FAIL, "telegram config", "TELEGRAM_CHAT_ID is unset — see candidates below")
     r.add(
         OK if cfg.contact_email and "@" in cfg.contact_email else WARN,
         "CONTACT_EMAIL",
@@ -159,8 +164,8 @@ async def run_doctor(cfg: Settings, *, config_dir: str | Path = CONFIG_DIR) -> R
         return r
 
     async with httpx.AsyncClient(timeout=12.0) as client:
-        await _check_http(r, client, "arxiv", "https://export.arxiv.org/api/query?max_results=1")
-        await _check_http(r, client, "llm", f"{cfg.llm_base_url.rstrip('/')}/models")
+        await _check_http(r, client, "arxiv", _arxiv_probe_url(cfg))
+        await _check_llm_auth(r, client, cfg)
         await _check_http(r, client, "github", "https://api.github.com/rate_limit")
         if cfg.telegram_bot_token:
             await _check_http(
@@ -169,7 +174,175 @@ async def run_doctor(cfg: Settings, *, config_dir: str | Path = CONFIG_DIR) -> R
                 "telegram",
                 f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getMe",
             )
+            if not cfg.telegram_chat_id:
+                await _report_candidate_chat_ids(r, client, cfg.telegram_bot_token)
+            else:
+                await _check_telegram_chat(r, client, cfg)
     return r
+
+
+async def _check_telegram_chat(r: Report, client: httpx.AsyncClient, cfg: Settings) -> None:
+    """Ask Telegram whether the configured chat actually exists.
+
+    `telegram config: token + chat id present` only proves two variables are non-empty. The
+    first real send then fails with a bare "400 Bad Request" whose *reason* — "chat not found"
+    is the usual one — only appears in the response body. Checking `getChat` here turns that
+    into a labelled FAIL before a digest is ever composed, and it costs one API call.
+    """
+    try:
+        resp = await client.get(
+            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/getChat",
+            params={"chat_id": cfg.telegram_chat_id},
+        )
+        body = resp.json()
+    except Exception as exc:
+        r.add(WARN, "telegram chat", f"could not verify chat: {type(exc).__name__}")
+        return
+
+    if body.get("ok"):
+        result = body.get("result") or {}
+        kind = result.get("type", "?")
+        name = result.get("title") or result.get("username") or result.get("first_name") or ""
+        r.add(OK, "telegram chat", f"reachable: {kind}{f' ({name})' if name else ''}")
+        return
+
+    r.add(
+        FAIL,
+        "telegram chat",
+        f"{body.get('error_code')} {body.get('description')} — TELEGRAM_CHAT_ID="
+        f"{cfg.telegram_chat_id} is not a chat this bot can post to. "
+        "A bot cannot open a conversation: send the bot /start first, then re-run doctor.",
+    )
+    # A failed getChat is exactly when the working ids are wanted, so list them here rather
+    # than making the operator clear the variable to see candidates.
+    candidates = await _report_candidate_chat_ids(r, client, cfg.telegram_bot_token)
+    configured = cfg.telegram_chat_id.strip()
+    if configured and not configured.startswith("-") and f"-{configured}" in dict(candidates):
+        r.add(
+            FAIL,
+            "telegram chat id",
+            f"looks like a group id with the sign dropped: set TELEGRAM_CHAT_ID=-{configured}",
+        )
+
+
+def extract_chat_ids(updates: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Pull (chat_id, label) pairs out of a getUpdates payload.
+
+    Covers every place a chat can appear: a normal `message` (a DM, or a group message if the
+    bot is not in privacy mode), a `channel_post` (a channel, where the bot sees posts but no
+    messages), and `my_chat_member` (the bot being added — which arrives *before* anyone has to
+    type anything, so it is the reliable way to get a group or channel id).
+
+    Calling getUpdates without an `offset` does not consume anything, so this is safe to run
+    while `screener feedback` owns the real offset.
+    """
+    found: dict[str, str] = {}
+    for update in updates:
+        for key in ("message", "channel_post", "edited_message", "my_chat_member"):
+            payload = update.get(key)
+            if not isinstance(payload, dict):
+                continue
+            chat = payload.get("chat")
+            if not isinstance(chat, dict) or "id" not in chat:
+                continue
+            chat_id = str(chat["id"])
+            kind = str(chat.get("type") or key)
+            name = chat.get("title") or chat.get("username") or chat.get("first_name") or ""
+            found.setdefault(chat_id, f"{kind}{f' ({name})' if name else ''}")
+    return sorted(found.items())
+
+
+async def _check_llm_auth(r: Report, client: httpx.AsyncClient, cfg: Settings) -> None:
+    """Query the provider *with* the credential.
+
+    The shared probe client is unauthenticated, so it reported the LLM endpoint as
+    "HTTP 401 (reachable; auth checked separately)" while nothing anywhere checked the auth —
+    a wrong or expired key looked exactly like a good one. Presence of an env var is not
+    evidence that the credential works, so this authenticates for real.
+    """
+    if not cfg.llm_api_key:
+        r.add(WARN, "net:llm", "skipped: no credential to authenticate with")
+        return
+    try:
+        resp = await client.get(
+            f"{cfg.llm_base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {cfg.llm_api_key}"},
+        )
+    except httpx.HTTPError as exc:
+        r.add(WARN, "net:llm", f"unreachable: {type(exc).__name__}")
+        return
+
+    if resp.status_code == 200:
+        ids = _model_ids(resp)
+        has_model = cfg.llm_deep in ids
+        r.add(
+            OK if has_model or not ids else WARN,
+            "net:llm",
+            f"HTTP 200, authenticated; {len(ids)} models"
+            + ("" if has_model or not ids else f" — {cfg.llm_deep} is NOT among them"),
+        )
+    elif resp.status_code in (401, 403):
+        r.add(
+            FAIL,
+            "net:llm",
+            f"HTTP {resp.status_code} WITH a credential — the key is rejected as invalid",
+        )
+    else:
+        r.add(WARN, "net:llm", f"HTTP {resp.status_code}")
+
+
+def _model_ids(resp: httpx.Response) -> list[str]:
+    try:
+        data = resp.json().get("data") or []
+    except Exception:
+        return []
+    return [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")]
+
+
+async def _report_candidate_chat_ids(
+    r: Report, client: httpx.AsyncClient, token: str
+) -> list[tuple[str, str]]:
+    """Print the chat ids this bot can see, so TELEGRAM_CHAT_ID can be pasted in.
+
+    Returns them as well as logging them, because the most common failure is not a missing id
+    but a *mangled* one: group and channel ids are negative, and dropping the sign silently
+    turns a group into a non-existent user chat. The caller then names that directly rather
+    than leaving the operator to compare two similar numbers by eye.
+    """
+    try:
+        resp = await client.get(f"https://api.telegram.org/bot{token}/getUpdates")
+        body = resp.json()
+    except Exception as exc:
+        r.add(WARN, "telegram chat id", f"could not fetch updates: {type(exc).__name__}")
+        return []
+
+    if not body.get("ok"):
+        r.add(WARN, "telegram chat id", f"getUpdates failed: {body.get('description')}")
+        return []
+
+    candidates = extract_chat_ids(list(body.get("result") or []))
+    if not candidates:
+        r.add(
+            WARN,
+            "telegram chat id",
+            "no chats visible. Open your bot and send it /start (a bot cannot message you "
+            "first), then re-run doctor.",
+        )
+        return []
+    for chat_id, label in candidates:
+        r.add(OK, "telegram chat id", f"TELEGRAM_CHAT_ID={chat_id}  [{label}]")
+    return candidates
+
+
+def _arxiv_probe_url(cfg: Settings) -> str:
+    """A *valid* arXiv query, shaped like the one the pipeline sends.
+
+    arXiv returns 400 for `/api/query?max_results=1` with no `search_query`, so a probe that
+    omits it reports the probe's own defect as a network failure. Using a real category also
+    means doctor verifies the query form the app depends on, not just that DNS resolves.
+    """
+    category = cfg.profile.categories[0] if cfg.profile.categories else "cs.AI"
+    return f"https://export.arxiv.org/api/query?search_query=cat:{category}&max_results=1"
 
 
 def _weight_maps_off_by(cfg: Settings) -> dict[str, float]:
@@ -218,14 +391,31 @@ def _httpx_client_error() -> str | None:
 
 
 async def _check_http(r: Report, client: httpx.AsyncClient, name: str, url: str) -> None:
+    """Probe one endpoint, and be precise about what each status means.
+
+    A blanket "anything below 500 is fine" hides the difference between *the server refused
+    us* (401 — reachable, credentials are checked separately) and *we sent a bad request*
+    (400 — a defect on our side). The latter shipped once already, disguised as an OK line,
+    because arXiv 400s on a query with no `search_query`.
+    """
     try:
         resp = await client.get(url)
-        # 401/403 still proves reachability; only transport failures are interesting here.
-        if resp.status_code < 500:
-            r.add(OK, f"net:{name}", f"HTTP {resp.status_code}")
-        else:
-            r.add(WARN, f"net:{name}", f"HTTP {resp.status_code}")
     except httpx.HTTPError as exc:
         r.add(WARN, f"net:{name}", f"unreachable: {type(exc).__name__}")
+        return
     except Exception as exc:
         r.add(WARN, f"net:{name}", f"{type(exc).__name__}: {exc}")
+        return
+
+    code = resp.status_code
+    if code < 300:
+        r.add(OK, f"net:{name}", f"HTTP {code}")
+    elif code in (401, 403):
+        # Reachable; whether the credential is good is a separate, explicit check.
+        r.add(OK, f"net:{name}", f"HTTP {code} (reachable; auth checked separately)")
+    elif code == 429:
+        r.add(WARN, f"net:{name}", "HTTP 429 (rate limited, but reachable)")
+    elif 400 <= code < 500:
+        r.add(FAIL, f"net:{name}", f"HTTP {code} — request rejected, so the request is wrong")
+    else:
+        r.add(WARN, f"net:{name}", f"HTTP {code} (server-side error)")

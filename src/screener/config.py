@@ -67,6 +67,9 @@ class Settings(BaseSettings):
 
     # --- runtime ---
     screener_db: str = "./screener.db"
+    #: Where an undeliverable digest is parked. Configurable so tests cannot touch
+    #: (or consume) a real outbox in the working directory.
+    screener_outbox: str = "./outbox"
     screener_mode: str = "live"  # live | dry
     screener_llm_fast: str = "deepseek-flash"
     screener_llm_deep: str = "deepseek-flash"

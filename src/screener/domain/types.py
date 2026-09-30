@@ -61,6 +61,27 @@ TOPICS: tuple[Topic, ...] = (
     "infrastructure/protocols",
 )
 
+#: Words that route a free-form tag to a Topic (§6.4).
+#:
+#: Explicit data rather than derived from the topic names. Deriving them does not work: the
+#: generic domain words ("multi", "agent") match everything, and "agentic RL" derives *zero*
+#: anchors because "agentic" is one of those generic words — so that topic could never be
+#: matched at all.
+#:
+#: Matching: an anchor of >= 6 characters matches a tag word that shares its first 6, which
+#: handles plurals ("benchmark"/"benchmarks", "protocol"/"protocols") while keeping "agent"
+#: away from "agentic". Shorter anchors ("rl", "gui", "mcp") must match a whole word, so "rl"
+#: does not fire on "worldly".
+TOPIC_ANCHORS: dict[Topic, tuple[str, ...]] = {
+    "evaluation & benchmarks": ("benchmark", "evaluation", "eval", "leaderboard", "metric"),
+    "multi-agent coordination": ("coordination", "orchestration", "delegation", "handoff"),
+    "memory & context": ("memory", "context", "compaction", "recall"),
+    "computer use": ("computer", "browser", "desktop", "gui", "screenshot"),
+    "safety & oversight": ("safety", "oversight", "misalignment", "jailbreak", "verifier"),
+    "agentic RL": ("agentic", "rl", "reinforcement", "policy", "post-training"),
+    "infrastructure/protocols": ("infrastructure", "protocol", "mcp", "tooling", "runtime"),
+}
+
 #: The eight rubric dimensions (§6.1).
 Dimension = Literal[
     "relevance",

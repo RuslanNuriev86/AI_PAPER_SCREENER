@@ -137,10 +137,19 @@ def revisit(
 def replay(
     date: Annotated[str, typer.Option("--date", help="YYYY-MM-DD")],
     selection: Annotated[Path | None, typer.Option(help="override selection.yaml")] = None,
+    write_outbox: Annotated[
+        bool,
+        typer.Option("--write-outbox", help="rebuild the digest and park it for delivery"),
+    ] = False,
     config_dir: Annotated[str, typer.Option(help="config directory")] = str(CONFIG_DIR),
 ) -> None:
-    """Re-score a stored run under current (or overridden) config. No network, no sends."""
-    from screener.pipeline.replay import replay_run
+    """Re-score a stored run under current (or overridden) config. No network, no sends.
+
+    With `--write-outbox` it also rebuilds the rendered digest and parks it, which recovers a
+    digest whose outbox artifact was lost: by then the papers are in the seen-set, so no later
+    run would ever rebuild it. The next `screener run` then delivers it.
+    """
+    from screener.pipeline.replay import recover_to_outbox, replay_run
 
     cfg = _settings(config_dir)
     if selection is not None:
@@ -149,6 +158,13 @@ def replay(
         cfg.selection = Selection.model_validate(yaml.safe_load(selection.read_text()) or {})
     result = replay_run(cfg, date)
     typer.echo(result.render())
+    if write_outbox:
+        path = recover_to_outbox(cfg, date)
+        if path is None:
+            typer.secho("nothing to recover for that date", fg=typer.colors.YELLOW)
+            raise typer.Exit(1)
+        typer.secho(f"parked for delivery: {path}", fg=typer.colors.GREEN)
+        typer.echo("the next `screener run` will send it")
     raise typer.Exit(0)
 
 
@@ -179,6 +195,29 @@ async def _feedback(cfg: Settings) -> int:
         count = await poll_feedback(deps, cfg)
     typer.echo(f"feedback: {count} new")
     return 0
+
+
+@app.command()
+def rearm(
+    date: Annotated[str, typer.Option("--date", help="YYYY-MM-DD")],
+    config_dir: Annotated[str, typer.Option(help="config directory")] = str(CONFIG_DIR),
+) -> None:
+    """Make a date's reviewed papers fresh again so the next run re-processes them.
+
+    Use when a digest was reviewed and paid for but never delivered and its outbox entry is
+    gone: the papers are in the seen-set and the review prose was never stored, so nothing can
+    be replayed — they have to be reviewed again. Only the shortlisted papers are cleared.
+    """
+    from screener.pipeline.replay import rearm as rearm_date
+
+    ids = rearm_date(_settings(config_dir), date)
+    if not ids:
+        typer.secho(f"nothing to re-arm for {date}", fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    typer.secho(f"re-armed {len(ids)} papers for {date}", fg=typer.colors.GREEN)
+    for arxiv_id in ids:
+        typer.echo(f"  {arxiv_id}")
+    typer.echo("the next `screener run` will re-review them")
 
 
 @app.command()

@@ -180,3 +180,194 @@ async def test_fake_llm_returns_valid_reviews_without_network() -> None:
     )
     assert isinstance(review, Review)
     assert "Something Distinct" in review.tldr
+
+
+# --- chat-id discovery (doctor) -----------------------------------------------------------
+# `TELEGRAM_CHAT_ID` is not look-up-able: it is whatever Telegram reports once the bot has
+# received something. These tests pin the extraction, since it is the one setup step that
+# cannot be done without a live round-trip.
+
+
+def test_extract_chat_ids_covers_dm_group_and_channel() -> None:
+    from screener.doctor import extract_chat_ids
+
+    updates = [
+        {"message": {"chat": {"id": 12345, "type": "private", "first_name": "Ada"}}},
+        {"message": {"chat": {"id": -1001234567890, "type": "supergroup", "title": "Agents"}}},
+        {"channel_post": {"chat": {"id": -1009876543210, "type": "channel", "title": "Feed"}}},
+        {
+            "my_chat_member": {
+                "chat": {"id": -1005555555555, "type": "group", "title": "Added Before Typing"}
+            }
+        },
+    ]
+    ids = dict(extract_chat_ids(updates))
+    assert ids["12345"] == "private (Ada)"
+    assert ids["-1001234567890"] == "supergroup (Agents)"
+    assert ids["-1009876543210"] == "channel (Feed)"
+    # my_chat_member arrives as soon as the bot is added, before anyone types anything.
+    assert ids["-1005555555555"] == "group (Added Before Typing)"
+
+
+def test_extract_chat_ids_deduplicates_and_ignores_junk() -> None:
+    from screener.doctor import extract_chat_ids
+
+    updates = [
+        {"message": {"chat": {"id": 7, "type": "private"}}},
+        {"message": {"chat": {"id": 7, "type": "private"}}},
+        {"message": {}},  # no chat
+        {"edited_message": "not a dict"},  # malformed
+        {"callback_query": {"id": "x"}},  # not a chat-bearing update
+    ]
+    assert extract_chat_ids(updates) == [("7", "private")]
+
+
+def test_extract_chat_ids_returns_empty_when_the_bot_has_heard_nothing() -> None:
+    from screener.doctor import extract_chat_ids
+
+    assert extract_chat_ids([]) == []
+
+
+# --- doctor's HTTP probe classification ---------------------------------------------------
+# A blanket "status < 500 is fine" once reported arXiv HTTP 400 as an OK line, hiding a defect
+# in the probe's own URL. These tests pin the distinction between "server refused us" and
+# "we sent a bad request".
+
+
+class _StubResp:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+class _StubClient:
+    def __init__(self, status_code: int) -> None:
+        self._code = status_code
+
+    async def get(self, url: str) -> _StubResp:
+        return _StubResp(self._code)
+
+
+async def _probe(code: int):  # type: ignore[no-untyped-def]
+    from screener.doctor import Report, _check_http
+
+    r = Report()
+    await _check_http(r, _StubClient(code), "x", "https://example.test")  # type: ignore[arg-type]
+    return r.lines[0]
+
+
+async def test_probe_2xx_is_ok() -> None:
+    assert (await _probe(200)).startswith("[  ok  ]")
+
+
+async def test_probe_401_is_ok_because_it_proves_reachability() -> None:
+    line = await _probe(401)
+    assert line.startswith("[  ok  ]")
+    assert "auth checked separately" in line
+
+
+async def test_probe_400_is_a_failure_not_an_ok() -> None:
+    """This exact status was reported as OK while the probe URL was malformed."""
+    line = await _probe(400)
+    assert line.startswith("[ fail ]")
+    assert "request is wrong" in line
+
+
+async def test_probe_429_and_5xx_are_warnings() -> None:
+    assert (await _probe(429)).startswith("[ warn ]")
+    assert (await _probe(503)).startswith("[ warn ]")
+
+
+def test_arxiv_probe_url_includes_a_search_query() -> None:
+    """arXiv 400s on a query without `search_query`, so the probe must send one."""
+    from screener.config import load_settings
+    from screener.doctor import _arxiv_probe_url
+
+    url = _arxiv_probe_url(load_settings("config"))
+    assert "search_query=" in url
+    assert "max_results=1" in url
+
+
+def test_arxiv_probe_url_falls_back_when_no_categories_are_configured() -> None:
+    from screener.config import Settings
+    from screener.doctor import _arxiv_probe_url
+
+    assert "search_query=cat:cs.AI" in _arxiv_probe_url(Settings())
+
+
+# --- prose bounds are truncation, not rejection -------------------------------------------
+# The first live run dropped a real paper because `what_they_did` came back ~430 chars against
+# a 420 limit. A cosmetic overrun must not cost a paper; semantic constraints stay strict.
+
+
+def test_prose_over_the_limit_is_truncated_not_rejected() -> None:
+    long_mechanism = "They train a process reward model. " * 30
+    review = Review(**{**VALID_REVIEW, "what_they_did": long_mechanism})
+    assert len(review.what_they_did) <= 420
+    assert review.what_they_did.endswith((".", "…"))
+
+
+def test_all_four_prose_fields_are_bounded() -> None:
+    review = Review(
+        **{
+            **VALID_REVIEW,
+            "tldr": "x" * 900,
+            "what_they_did": "y" * 900,
+            "why_it_matters": "z" * 900,
+            "caveats": "w" * 900,
+        }
+    )
+    assert len(review.tldr) <= 220
+    assert len(review.what_they_did) <= 420
+    assert len(review.why_it_matters) <= 420
+    assert len(review.caveats) <= 240
+
+
+def test_short_prose_is_left_alone() -> None:
+    review = Review(**VALID_REVIEW)
+    assert review.what_they_did == VALID_REVIEW["what_they_did"]
+    assert not review.what_they_did.endswith("…")
+
+
+def test_semantic_errors_are_still_hard_failures() -> None:
+    """Truncation applies to length only; a bad enum must still be rejected."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        Review(**{**VALID_REVIEW, "hard_flag": "definitely_not_a_flag"})
+    with pytest.raises(pydantic.ValidationError):
+        Review(**{**VALID_REVIEW, "scores": {**VALID_REVIEW["scores"], "relevance": 99}})
+
+
+def test_truncate_prose_never_exceeds_the_limit() -> None:
+    """Sweep the boundary cases, which is where the first version was wrong.
+
+    Slicing to `limit` and *then* appending an ellipsis returns limit + 1, which still fails
+    `max_length`. That shipped once and cost a real paper on the first live run; the original
+    tests missed it because their inputs never placed a word or sentence boundary at the cut.
+    """
+    from screener.domain.models import truncate_prose
+
+    for limit in (10, 20, 240, 420):
+        for suffix in ("", " x", " end.", " more words here", ".", " "):
+            for n in range(limit - 3, limit + 40):
+                text = "a" * n + suffix
+                out = truncate_prose(text, limit)
+                assert len(out) <= limit, f"limit={limit} n={n} suffix={suffix!r} -> {len(out)}"
+
+
+def test_truncate_prose_prefers_a_sentence_boundary() -> None:
+    from screener.domain.models import truncate_prose
+
+    text = "First sentence about agents. Second sentence that will not fit at all."
+    out = truncate_prose(text, 45)
+    assert len(out) <= 45
+    assert out.endswith(".")
+    assert "Second" not in out
+
+
+def test_truncate_prose_marks_a_hard_cut() -> None:
+    from screener.domain.models import truncate_prose
+
+    out = truncate_prose("z" * 500, 100)
+    assert len(out) <= 100
+    assert out.endswith("…")

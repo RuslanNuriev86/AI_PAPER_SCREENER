@@ -74,3 +74,14 @@ def repo(tmp_path: Path):
 @pytest.fixture
 def now() -> datetime:
     return NOW
+
+
+@pytest.fixture(autouse=True)
+def _isolated_outbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the outbox at a per-test directory.
+
+    An earlier version of the suite resolved the outbox relative to the working directory, so a
+    pipeline test found a real stranded digest in `./outbox`, "sent" it through a fake notifier,
+    and deleted it. Tests must not be able to touch anything outside their tmp dir.
+    """
+    monkeypatch.setenv("SCREENER_OUTBOX", str(tmp_path / "outbox"))

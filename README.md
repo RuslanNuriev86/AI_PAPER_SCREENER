@@ -72,6 +72,40 @@ make doctor           # validate config, DB, network, credentials
 make dry              # full pipeline, no Telegram send
 ```
 
+### Getting `TELEGRAM_CHAT_ID`
+
+It is not something you look up — it is whatever Telegram reports once the bot has received
+something, so the order matters:
+
+1. Message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token into
+   `TELEGRAM_BOT_TOKEN`.
+2. **Open your bot and send it `/start`.** A bot cannot initiate a conversation, so until you
+   do this `getUpdates` is empty and there is nothing to read. (For a group or channel, add the
+   bot instead — its id appears on join via `my_chat_member`, before anyone types anything.)
+3. Run `make doctor`. With the token set but no chat id, it prints every chat the bot can see:
+
+```
+[  ok  ] telegram chat id       TELEGRAM_CHAT_ID=88776655  [private (You)]
+[  ok  ] telegram chat id       TELEGRAM_CHAT_ID=-1001234567890  [supergroup (Agents Digest)]
+```
+
+Paste the one you want into `.env`. **Positive ids are DMs** (what §16 decision 2 assumes);
+group and channel ids are negative. `doctor` calls `getUpdates` without an `offset`, so this is
+non-destructive and will not consume updates that `screener feedback` needs.
+
+`doctor` also **verifies** the id with `getChat` rather than trusting that the variable is
+non-empty, because a wrong id fails the same way a good one passes every local check and only
+surfaces as a bare `400 Bad Request` on the first send. Two failures it names explicitly:
+
+```
+[ fail ] telegram chat       400 Bad Request: chat not found — TELEGRAM_CHAT_ID=5402616139 …
+[  ok  ] telegram chat id    TELEGRAM_CHAT_ID=-5402616139  [group (ai_papers)]
+[ fail ] telegram chat id    looks like a group id with the sign dropped: set TELEGRAM_CHAT_ID=-5402616139
+```
+
+**The sign matters.** Group and channel ids are negative; dropping the minus turns a group into
+a non-existent user chat, and that is the single most common cause of this error.
+
 ## Commands
 
 | Command | What it does |
@@ -81,9 +115,30 @@ make dry              # full pipeline, no Telegram send
 | `screener doctor` | validate config, credentials, DB, network, clock, proxy env |
 | `screener revisit` | measure due outcome rungs (separate job, off the delivery path) |
 | `screener replay --date` | rebuild a digest from stored data (no network, no send) |
+| `screener replay --date --write-outbox` | rebuild a digest and park it for the next run to send |
+| `screener rearm --date` | make a day's reviewed papers fresh again (recovery, see below) |
 | `screener backtest --since` | re-score stored rankings under candidate weights |
 | `screener feedback` | poll Telegram for replies (text only — see below) |
 | `screener eval` / `prune` / `stats` | maturity coverage, retention, row counts |
+
+## When a digest is reviewed but never delivered
+
+A failed send parks the rendered digest in `outbox/`, and the **next run retries it
+automatically** before doing anything else — no human in the loop. Recovery works from either
+outbox artifact, so losing the `.json` sidecar does not lose the digest.
+
+If the outbox entry itself is gone, the papers are still in the seen-set and no future run will
+rebuild them. `rearm` is the way back:
+
+```bash
+screener rearm --date 2026-09-30   # clears only that day's *reviewed* papers
+screener run                       # re-reviews them (~$0.02) and sends
+```
+
+It clears the seen-set rows for the shortlisted papers only — the other few thousand stay seen,
+so recovery costs one re-review rather than a re-fetch of a day. It also clears *undelivered*
+delivery rows but never a successful send, so at-most-once delivery still holds: `rearm` cannot
+make the reader receive something twice.
 
 ## Two host gotchas worth knowing
 

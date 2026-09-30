@@ -5,6 +5,8 @@ that claim either holds or does not.
 
 from __future__ import annotations
 
+import pytest
+
 from screener.domain.models import Profile
 from screener.domain.relevance import MIN_ABSTRACT_WORDS, gate, normalise_topics, relevance_hint
 from screener.domain.types import HardFlag
@@ -136,3 +138,47 @@ def test_topics_normalise_vague_model_tags() -> None:
 
 def test_unknown_tags_never_reach_the_cap() -> None:
     assert normalise_topics(["quantum chromodynamics"]) == []
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [
+        ("benchmark", "evaluation & benchmarks"),
+        ("benchmarks", "evaluation & benchmarks"),
+        ("coordination", "multi-agent coordination"),
+        ("memory", "memory & context"),
+        ("computer-use-agents", "computer use"),
+        ("gui-agent", "computer use"),
+        ("misalignment", "safety & oversight"),
+        ("post-training", "agentic RL"),
+        ("protocol", "infrastructure/protocols"),
+        ("mcp", "infrastructure/protocols"),
+    ],
+)
+def test_anchors_route_tags_to_the_right_topic(tag: str, expected: str) -> None:
+    assert normalise_topics([tag]) == [expected]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "multi-hop-qa",  # "multi" must not imply multi-agent coordination
+        "worldly",  # "rl" must not match inside a word
+        "retrieval-augmented-generation",  # "eval" must not match inside "retrieval"
+        "multi-agent",  # ambiguous on its own; no anchor present
+        "quantum-chromodynamics",
+    ],
+)
+def test_generic_words_do_not_route_tags(tag: str) -> None:
+    """Regression: collapsing every paper into one topic turns per_topic_cap into a global cap.
+
+    On live data six of six papers mapped to "multi-agent coordination" because "multi" and
+    "agent" matched everything, which would have limited the whole digest to two items.
+    """
+    assert normalise_topics([tag]) == []
+
+
+def test_a_paper_may_legitimately_map_to_several_topics() -> None:
+    topics = normalise_topics(["multi-agent", "safety-verification", "benchmark"])
+    assert "safety & oversight" in topics
+    assert "evaluation & benchmarks" in topics

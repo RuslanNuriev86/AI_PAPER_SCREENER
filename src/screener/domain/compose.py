@@ -79,16 +79,23 @@ def render_item(r: Ranking, paper: Paper, index: int) -> str:
     if paper.comment and "accept" in paper.comment.lower():
         meta += f" · {escape(paper.comment[:60])}"
 
-    links = [f'<a href="{escape(paper.abs_url)}">abs</a>']
+    # Every link is conditional on a non-empty URL. `Paper.abs_url` defaults to "" and the
+    # `papers.abs_url` column is NOT NULL DEFAULT '', so an unguarded link emits
+    # `<a href="">`, which Telegram rejects with a 400 (an empty href is not a valid entity).
+    links: list[str] = []
+    if paper.abs_url:
+        links.append(f'<a href="{escape(paper.abs_url)}">abs</a>')
     if paper.pdf_url:
         links.append(f'<a href="{escape(paper.pdf_url)}">pdf</a>')
     if paper.code_url:
         links.append(f'<a href="{escape(paper.code_url)}">code</a>')
+    if not links:
+        links.append(f"<code>{escape(paper.arxiv_id)}</code>")
 
     lines = [
         header,
         meta,
-        " · ".join(links),
+        " · ".join(links) if links else meta,
         "",
         f"<b>TL;DR</b> {escape(r.review.tldr)}",
         "",

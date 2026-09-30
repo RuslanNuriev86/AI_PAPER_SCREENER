@@ -11,7 +11,7 @@ import re
 from collections.abc import Iterable, Sequence
 
 from screener.domain.models import GateResult, Paper, Profile, RelevanceHint
-from screener.domain.types import TOPICS, HardFlag, Topic
+from screener.domain.types import TOPIC_ANCHORS, TOPICS, HardFlag, Topic
 
 #: Below this many words an abstract cannot support a technical judgment (§5 hard reject).
 MIN_ABSTRACT_WORDS = 120
@@ -101,20 +101,50 @@ def gate(paper: Paper, profile: Profile) -> GateResult:
     return GateResult(paper=paper, keep=True, hint=hint)
 
 
+#: Anchors at least this long match on a shared prefix, so plurals line up.
+_PREFIX_MATCH_LEN = 6
+
+
+def _anchor_matches(anchor: str, words: frozenset[str], raw: str) -> bool:
+    """Does one tag refer to a topic, via this anchor?
+
+    Three rules, each earning its place:
+
+    * a **phrase** anchor ("post-training") is matched against the raw tag, since splitting on
+      punctuation destroys it;
+    * a **long** anchor matches a tag word sharing its first `_PREFIX_MATCH_LEN` characters,
+      which lines up "benchmark"/"benchmarks" and "protocol"/"protocols";
+    * a **short** anchor ("rl", "gui", "mcp") must match a whole word. Substring matching here
+      is what made "eval" fire on "ret**rieval**" and "rl" on "wo**rl**dly".
+    """
+    if "-" in anchor or " " in anchor:
+        return anchor in raw
+    if len(anchor) >= _PREFIX_MATCH_LEN:
+        head = anchor[:_PREFIX_MATCH_LEN]
+        return any(len(w) >= _PREFIX_MATCH_LEN and w[:_PREFIX_MATCH_LEN] == head for w in words)
+    return anchor in words
+
+
 def normalise_topics(tags: Sequence[str]) -> list[Topic]:
     """Map free-form review tags onto the closed Topic vocabulary (§6.4).
 
-    Models emit "benchmarks" where the vocabulary says "evaluation & benchmarks", so
-    matching is case-insensitive and bidirectional on content words. Tags that match nothing
-    are dropped from `topics` but kept in `Ranking.tags` for similarity, so no free-form
-    string can ever reach `per_topic_cap`.
+    Matching is on the explicit anchors in `types.TOPIC_ANCHORS`, never on generic domain
+    words: a paper tagged "multi-hop-qa" is not thereby about multi-agent coordination. Getting
+    this wrong is not cosmetic — it collapsed six of six live papers into one topic, which
+    turned `per_topic_cap` from a diversification rule into a global cap on the digest.
+
+    A tag that matches nothing is dropped from `topics` but kept in `Ranking.tags` for
+    similarity, so an unmatched paper carries no topic rather than a wrong one.
     """
     out: list[Topic] = []
-    for topic in TOPICS:
-        parts = [p for p in re.split(r"[^a-z0-9]+", topic.lower()) if len(p) > 3]
-        for tag in tags:
-            low = tag.lower()
-            if low in topic.lower() or any(p in low for p in parts):
+    for tag in tags:
+        raw = tag.lower().replace("_", "-").replace("/", "-")
+        words = frozenset(w for w in re.split(r"[^a-z0-9]+", raw) if w)
+        for topic in TOPICS:
+            spelled = (topic.lower(), topic.lower().replace(" ", "-").replace(" & ", "-and-"))
+            hit = any(name in raw for name in spelled) or any(
+                _anchor_matches(a, words, raw) for a in TOPIC_ANCHORS[topic]
+            )
+            if hit and topic not in out:
                 out.append(topic)
-                break
     return out

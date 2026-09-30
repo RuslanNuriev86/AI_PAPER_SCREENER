@@ -144,8 +144,43 @@ class Scores(BaseModel):
         return {k: float(v) for k, v in data.items() if v is not None}
 
 
+def truncate_prose(value: str, limit: int) -> str:
+    """Fit prose to `limit`, preferring a sentence boundary, then a word boundary.
+
+    The length bounds in §7 exist so an item fits a Telegram message. Enforcing them by
+    *rejecting* the record throws away a perfectly good summary over a few characters — which
+    happened on the first live run, where `what_they_did` came back ~430 chars against a 420
+    limit and the paper was dropped. Truncation enforces the same contract without losing the
+    paper; semantic constraints (enums, ranges, required fields) stay hard failures.
+    """
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+
+    # `window` is exactly `limit` long, so any slice below is already bounded. Adding the
+    # ellipsis must then fit *inside* the limit — appending it to a `limit`-length slice
+    # returns limit + 1 and still fails max_length, which is precisely what the first live
+    # run hit.
+    window = text[:limit]
+    ellipsis = "…"
+    for boundary in (". ", "! ", "? "):
+        cut = window.rfind(boundary)
+        if cut > limit // 2:
+            # cut <= limit - 2 for a two-character boundary, so cut + 1 <= limit - 1.
+            return text[: cut + 1].strip()
+    cut = window.rfind(" ")
+    if cut > limit // 2:
+        return text[:cut].rstrip(" ,;:")[: limit - len(ellipsis)] + ellipsis
+    return text[: limit - len(ellipsis)].rstrip() + ellipsis
+
+
 class Review(BaseModel):
-    """The reviewed item (§7). Length bounds are the contract, enforced at parse time."""
+    """The reviewed item (§7).
+
+    Prose fields are truncated to their bound rather than rejected: a summary that is 20
+    characters long is still a valid summary, and dropping it would cost a paper for cosmetic
+    reasons. Everything else (enums, ranges, required fields) remains a hard validation error.
+    """
 
     tldr: str = Field(max_length=220)
     what_they_did: str = Field(max_length=420)
@@ -157,6 +192,26 @@ class Review(BaseModel):
     scores: Scores
     soft_flags: list[SoftFlag] = Field(default_factory=list)
     hard_flag: HardFlag | None = None
+
+    @field_validator("tldr", mode="before")
+    @classmethod
+    def _fit_tldr(cls, v: object) -> object:
+        return truncate_prose(v, 220) if isinstance(v, str) else v
+
+    @field_validator("what_they_did", mode="before")
+    @classmethod
+    def _fit_what(cls, v: object) -> object:
+        return truncate_prose(v, 420) if isinstance(v, str) else v
+
+    @field_validator("why_it_matters", mode="before")
+    @classmethod
+    def _fit_why(cls, v: object) -> object:
+        return truncate_prose(v, 420) if isinstance(v, str) else v
+
+    @field_validator("caveats", mode="before")
+    @classmethod
+    def _fit_caveats(cls, v: object) -> object:
+        return truncate_prose(v, 240) if isinstance(v, str) else v
 
     def text_blob(self) -> str:
         return " ".join([self.tldr, self.what_they_did, self.why_it_matters, self.caveats])
@@ -459,4 +514,5 @@ __all__ = [
     "WatchlistEntry",
     "default_weights",
     "rubric_weight_vector",
+    "truncate_prose",
 ]

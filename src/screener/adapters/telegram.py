@@ -64,32 +64,73 @@ class TelegramNotifier:
                 "parse_mode": "HTML",
                 "link_preview_options": {"is_disabled": True},
             }
-            resp = await self._post("sendMessage", payload)
+            resp = await self._post(
+                "sendMessage", payload, context=f"chunk {i + 1}/{len(chunks)} ({len(chunk)} chars)"
+            )
             result = resp.get("result") or {}
             assert isinstance(result, dict)
             ids.append(MessageId(str(result.get("message_id"))))
         return ids
 
-    async def _post(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post(
+        self, method: str, payload: dict[str, Any], *, context: str = ""
+    ) -> dict[str, Any]:
+        """POST one Bot API method.
+
+        Two behaviours that the first version got wrong, both of which turned a diagnosable
+        Telegram error into an uninformative one:
+
+        * **the response body is read before any status check.** `raise_for_status()` on a 4xx
+          discards the body, and Telegram puts the actual reason in it — "chat not found",
+          "can't parse entities", "message is too long". The bare httpx message says none of
+          that.
+        * **only retryable failures are retried.** A 400 is permanent: retrying it three times
+          just delays the error and triples the log noise. 429 and 5xx are retried.
+        """
         last: Exception | None = None
         for attempt in range(3):
             try:
                 resp = await self._client.post(self._url(method), json=payload)
-                if resp.status_code == 429:
-                    retry_after = float(
-                        (resp.json() or {}).get("parameters", {}).get("retry_after", 1)
-                    )
-                    log.warning("telegram.rate_limited", retry_after=retry_after)
-                    await asyncio.sleep(retry_after)
-                    continue
-                resp.raise_for_status()
-                body = resp.json()
-                if not body.get("ok"):
-                    raise RuntimeError(f"telegram error: {body.get('description')}")
-                return dict(body)
-            except (httpx.HTTPError, RuntimeError) as exc:
+            except httpx.HTTPError as exc:
                 last = exc
                 await asyncio.sleep(2**attempt)
+                continue
+
+            body: dict[str, Any] = {}
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    body = parsed
+            except ValueError:
+                pass
+
+            if resp.status_code == 429:
+                retry_after = float((body.get("parameters") or {}).get("retry_after", 1))
+                log.warning("telegram.rate_limited", retry_after=retry_after, method=method)
+                await asyncio.sleep(retry_after)
+                continue
+
+            if body.get("ok"):
+                return body
+
+            description = str(body.get("description") or resp.reason_phrase or "no description")
+            error_code = body.get("error_code", resp.status_code)
+            detail = f"telegram {method} failed: {error_code} {description}"
+            if context:
+                detail += f" [{context}]"
+
+            if resp.status_code >= 500:
+                last = RuntimeError(detail)
+                log.warning("telegram.server_error", method=method, status=resp.status_code)
+                await asyncio.sleep(2**attempt)
+                continue
+
+            # A 4xx that is not 429 will not improve with repetition.
+            log.error(
+                "telegram.permanent_error", method=method, status=resp.status_code, detail=detail
+            )
+            raise RuntimeError(detail)
+
         raise RuntimeError(f"telegram {method} failed after retries: {last}")
 
     # -- feedback (§8.3) ---------------------------------------------------------------

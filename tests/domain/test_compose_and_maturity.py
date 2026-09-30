@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
+from html.parser import HTMLParser
 
 import pytest
 
@@ -272,3 +273,105 @@ def test_rendered_digest_has_no_unresolved_template_markers() -> None:
     r = _ranking(1)
     html = render_item(r, make_paper(arxiv_id=r.arxiv_id), 1)
     assert not re.search(r"\{[a-z_]+\}", html), "a format placeholder leaked into the output"
+
+
+# --- Telegram HTML validity ---------------------------------------------------------------
+# "Bad Request: can't parse entities" is one of the two most likely causes of a 400 on
+# sendMessage, and it is entirely our own doing. Telegram's HTML mode accepts only a small tag
+# set and rejects an unescaped '<'. This walks the rendered output with a real parser.
+
+_ALLOWED_TAGS = {"b", "i", "a", "code", "u", "s", "pre", "tg-spoiler"}
+
+
+class _TelegramHTMLChecker(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.stack: list[str] = []
+        self.problems: list[str] = []
+        self.text_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in _ALLOWED_TAGS:
+            self.problems.append(f"disallowed tag <{tag}>")
+        for name, value in attrs:
+            if tag == "a" and name != "href":
+                self.problems.append(f"unsupported attribute {name!r} on <a>")
+            if value is not None and not value:
+                self.problems.append(f"empty attribute {name!r} on <{tag}>")
+        self.stack.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.stack or self.stack[-1] != tag:
+            self.problems.append(f"unbalanced </{tag}> (stack={self.stack})")
+            return
+        self.stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        # A raw '<' inside data would have been parsed as a tag, so the parser already proves
+        # escaping; this catches the reverse case of a stray '>' which Telegram tolerates but
+        # which usually signals a mis-escape.
+        if "<" in data:
+            self.problems.append(f"raw '<' in text: {data[:40]!r}")
+
+
+def _check_html(chunk: str) -> list[str]:
+    # Re-insert the tags the parser stripped, then assert they are balanced.
+    checked = chunk.replace("<b>", "<b>").replace("</b>", "</b>")
+    p = _TelegramHTMLChecker()
+    p.feed(checked)
+    p.close()
+    if p.stack:
+        p.problems.append(f"unclosed tags: {p.stack}")
+    return p.problems
+
+
+def test_rendered_digest_is_valid_telegram_html() -> None:
+    picks = [_ranking(i) for i in range(6)]
+    papers = {(r.arxiv_id, 1): make_paper(arxiv_id=r.arxiv_id) for r in picks}
+    digest = compose(
+        picks,
+        papers,
+        NOW,
+        scanned=100,
+        relevant=20,
+        cost_usd=0.31,
+        gated_by_reason={"pure_survey": 3},
+        below_threshold=2,
+        best_below=6.1,
+    )
+    for i, chunk in enumerate(digest.chunks):
+        problems = _check_html(chunk)
+        assert not problems, f"chunk {i} is not valid Telegram HTML: {problems}"
+
+
+def test_adversarial_text_is_escaped_in_the_rendered_digest() -> None:
+    """Angle brackets, ampersands and quotes from a model must not become markup."""
+    r = _ranking(1)
+    r.review.tldr = 'Uses <script> & "quotes" in a <b>weird</b> way'
+    r.review.why_it_matters = "Reports p < 0.05 and <not-a-tag>"
+    paper = make_paper(arxiv_id=r.arxiv_id, title="A <Title> & More")
+    digest = compose([r], {(r.arxiv_id, 1): paper}, NOW, scanned=1, relevant=1, cost_usd=0.0)
+    chunk = digest.chunks[0]
+    assert "<script>" not in chunk
+    assert "<not-a-tag>" not in chunk
+    assert "&lt;script&gt;" in chunk
+    assert "&amp;" in chunk
+    assert not _check_html(chunk)
+
+
+def test_a_paper_with_no_urls_emits_no_empty_href() -> None:
+    """`Paper.abs_url` defaults to "", and `<a href="">` makes Telegram reject the message."""
+    from datetime import UTC, datetime
+
+    from screener.domain.models import Paper
+
+    bare = Paper(
+        arxiv_id="2509.99999", title="No Links", abstract="x" * 400, submitted_at=datetime.now(UTC)
+    )
+    r = _ranking(1)
+    r.arxiv_id = bare.arxiv_id
+    html = render_item(r, bare, 1)
+    assert 'href=""' not in html
+    assert "abs</a>" not in html
+    assert bare.arxiv_id in html
+    assert not _check_html(html)

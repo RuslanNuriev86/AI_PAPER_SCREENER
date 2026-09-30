@@ -27,6 +27,27 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 
+def schema_instructions(schema: type[BaseModel]) -> str:
+    """Render the target schema as text to append to the system prompt.
+
+    The `LLM` port receives `schema` and previously used it *only* for validation, never to
+    tell the model what shape to produce. The model therefore guessed, and guessed wrong in a
+    consistent way: it emitted the six rubric scores flat at the top level instead of nested
+    under `scores`, so 100% of first attempts failed validation and every paper paid for a
+    repair round-trip.
+
+    Static per schema, and appended after the static prompt body, so the cacheable prefix of
+    the prompt is unchanged.
+    """
+    return (
+        "\n\n## Required output shape\n\n"
+        "Return a single JSON object matching this JSON Schema exactly. Note in particular "
+        "that the rubric scores are **nested under `scores`**, not flattened to the top level, "
+        "and that every field listed as required must be present.\n\n"
+        "```json\n" + json.dumps(schema.model_json_schema(), indent=2) + "\n```\n"
+    )
+
+
 def extract_json(text: str) -> str:
     """Pull a JSON object out of a model response.
 
@@ -94,7 +115,7 @@ class OpenAILikeLLM:
         failure, not a run failure, and the second failure drops the paper.
         """
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": prompt.body},
+            {"role": "system", "content": prompt.body + schema_instructions(schema)},
             {"role": "user", "content": payload},
         ]
         last_error: Exception | None = None
@@ -118,7 +139,14 @@ class OpenAILikeLLM:
                 return schema.model_validate_json(extract_json(content))
             except (ValidationError, json.JSONDecodeError, ValueError) as exc:
                 last_error = exc
-                log.warning("llm.invalid_json", attempt=attempt, schema=schema.__name__)
+                log.warning(
+                    "llm.invalid_json",
+                    attempt=attempt,
+                    schema=schema.__name__,
+                    # The error text is what makes a retry diagnosable: "invalid json" alone
+                    # cannot distinguish a malformed body from one harmless stray field.
+                    error=str(exc).replace("\n", " ")[:300],
+                )
                 messages = [
                     *messages,
                     {"role": "assistant", "content": content},

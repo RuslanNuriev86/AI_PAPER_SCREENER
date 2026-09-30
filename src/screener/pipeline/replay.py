@@ -102,9 +102,14 @@ def _stored_rankings(conn: sqlite3.Connection, where: str, params: list[object])
 def replay_run(cfg: Settings, date: str) -> ReplayResult:
     conn = _connect(cfg)
     try:
-        runs = conn.execute(
-            "SELECT run_id FROM runs WHERE date(started_at)=? ORDER BY started_at", (date,)
-        ).fetchall()
+        try:
+            runs = conn.execute(
+                "SELECT run_id FROM runs WHERE date(started_at)=? ORDER BY started_at", (date,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # A DB that has never been migrated is "nothing stored", not a crash: the CLI turns
+            # an empty result into a readable "no stored rankings for that date".
+            return ReplayResult(date=date, run_ids=[], ranked=[], picks=[])
         run_ids = [str(r["run_id"]) for r in runs]
         if not run_ids:
             return ReplayResult(date=date, run_ids=[], ranked=[], picks=[])
@@ -178,3 +183,115 @@ def selection_from_file(path: Path) -> Selection:
     import yaml
 
     return Selection.model_validate(yaml.safe_load(path.read_text()) or {})
+
+
+def recover_to_outbox(cfg: Settings, date: str, outbox: Path | None = None) -> Path | None:
+    """Rebuild a digest from stored data and park it for delivery.
+
+    This is the recovery path for a digest that was rendered but could not be sent and whose
+    outbox artifact was then lost. By the time it is discovered the papers are usually already
+    in the seen-set, so no future run will rebuild it — the *only* remaining source is the
+    stored `rankings`/`assessments` for that date, which is exactly what this reads.
+
+    Nothing is sent here: the digest goes to the outbox and the next `screener run` delivers it
+    through the normal retry, so delivery stays in one place.
+    """
+    from screener.adapters.sqlite_repo import SqliteRepository
+    from screener.domain.compose import compose
+    from screener.pipeline.deliver import OUTBOX, _write_outbox
+
+    conn = _connect(cfg)
+    try:
+        runs = conn.execute(
+            "SELECT run_id, stats, cost_usd FROM runs WHERE date(started_at)=? ORDER BY started_at",
+            (date,),
+        ).fetchall()
+        if not runs:
+            return None
+        run_ids = [str(r["run_id"]) for r in runs]
+        placeholders = ",".join("?" for _ in run_ids)
+        ranked = _stored_rankings(conn, f"run_id IN ({placeholders})", list(run_ids))
+        if not ranked:
+            return None
+
+        stats = json.loads(str(runs[-1]["stats"]) or "{}")
+        scanned = int((stats.get("stage_counts") or {}).get("fetched", 0))
+        relevant = int((stats.get("stage_counts") or {}).get("gated_kept", 0))
+        cost = sum(float(r["cost_usd"] or 0) for r in runs)
+
+        picks = select(ranked, cfg.selection)
+        repo = SqliteRepository(cfg.screener_db)
+        try:
+            papers = repo.papers_by_key([(r.arxiv_id, r.version) for r in picks])
+        finally:
+            repo.close()
+    finally:
+        conn.close()
+
+    if not picks:
+        return None
+
+    digest = compose(
+        picks,
+        papers,
+        datetime.now(),
+        scanned=scanned,
+        relevant=relevant,
+        cost_usd=cost,
+        gated_by_reason={},
+        below_threshold=max(0, len(ranked) - len(picks)),
+    )
+    target = outbox or Path(cfg.screener_outbox or OUTBOX)
+    return _write_outbox(digest, datetime.now(), target)
+
+
+def rearm(cfg: Settings, date: str) -> list[str]:
+    """Make a date's reviewed papers fresh again so the next run re-processes them.
+
+    Recovery for the case that actually happened: a digest was reviewed and paid for, the send
+    failed, and the outbox artifact was then lost. The papers are in the seen-set, so no future
+    run rebuilds them, and there is nothing to replay because the *prose* was only ever in the
+    delivered message. Clearing their `gate_results` rows makes the next run treat them as new.
+
+    Only the papers that were actually shortlisted are cleared, not the whole window: the other
+    few thousand papers stay seen, so this costs one re-review rather than a re-fetch of a day.
+
+    **Undelivered delivery rows are cleared; successful sends are not.** `dedupe_revisions` would
+    otherwise drop a re-armed paper as "already delivered", which would make this command a
+    no-op in exactly the case it exists for — while clearing a *successful* send would risk
+    breaking the at-most-once guarantee (§10). Recovery is for failed delivery, so that is the
+    line.
+
+    Returns the arxiv_ids that were re-armed.
+    """
+    conn = _connect(cfg)
+    try:
+        try:
+            run_ids = [
+                str(r["run_id"])
+                for r in conn.execute(
+                    "SELECT run_id FROM runs WHERE date(started_at)=?", (date,)
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            return []
+        if not run_ids:
+            return []
+        placeholders = ",".join("?" for _ in run_ids)
+        rows = conn.execute(
+            f"SELECT DISTINCT arxiv_id, version FROM rankings WHERE run_id IN ({placeholders})",
+            run_ids,
+        ).fetchall()
+        keys = [(str(r["arxiv_id"]), int(r["version"])) for r in rows]
+        for arxiv_id, version in keys:
+            conn.execute(
+                "DELETE FROM gate_results WHERE arxiv_id=? AND version=?", (arxiv_id, version)
+            )
+            conn.execute(
+                "DELETE FROM deliveries WHERE arxiv_id=? AND version=? AND message_id IS NULL",
+                (arxiv_id, version),
+            )
+        conn.commit()
+        return [k[0] for k in keys]
+    finally:
+        conn.close()

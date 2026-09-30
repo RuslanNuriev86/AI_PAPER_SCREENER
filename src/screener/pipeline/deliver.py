@@ -71,23 +71,50 @@ def _write_outbox(digest: Digest, now: datetime, outbox: Path) -> Path:
     return path
 
 
+#: Separator between message chunks in the rendered `.html` artifact.
+_HTML_SEPARATOR = "\n\n<hr/>\n\n"
+
+
 def pending_outbox(outbox: Path = OUTBOX) -> Path | None:
-    """The oldest unsent digest, if any. Retried at the head of the next run."""
+    """The oldest unsent digest, if any. Retried at the head of the next run.
+
+    Accepts **either** artifact. Keying the retry solely on the `.json` sidecar meant that
+    losing that one file stranded the digest forever: the papers are already in the seen-set,
+    so no later run would ever rebuild it. The human-readable `.html` is the durable artifact
+    and is now sufficient on its own.
+    """
     if not outbox.exists():
         return None
-    files = sorted(outbox.glob("*.json"))
-    return files[0] if files else None
+    candidates = sorted(outbox.glob("*.json")) or sorted(outbox.glob("*.html"))
+    return candidates[0] if candidates else None
 
 
 def load_outbox(path: Path) -> tuple[list[str], list[tuple[str, int, int]]]:
-    data = json.loads(path.read_text())
-    chunks = [str(c) for c in data["chunks"]]
-    items = [(str(i["arxiv_id"]), int(i["version"]), int(i["chunk_index"])) for i in data["items"]]
-    return chunks, items
+    """Recover the chunks to send, from either artifact.
+
+    From `.json` the item→chunk map is available; from `.html` it is not, and the chunks are
+    reconstructed by splitting on the separator that wrote them. An empty item list is honest:
+    it means the digest can be re-sent but not attributed.
+    """
+    if path.suffix == ".json":
+        data = json.loads(path.read_text())
+        chunks = [str(c) for c in data["chunks"]]
+        items = [
+            (str(i["arxiv_id"]), int(i["version"]), int(i["chunk_index"])) for i in data["items"]
+        ]
+        return chunks, items
+    return path.read_text().split(_HTML_SEPARATOR), []
 
 
 def retire_outbox(path: Path) -> None:
+    """Remove the whole digest, both artifacts.
+
+    Retiring only the file that was passed in would leave the sibling behind — and since
+    `pending_outbox` now accepts either one, an orphan would be re-sent forever.
+    """
     path.unlink(missing_ok=True)
+    for suffix in (".json", ".html"):
+        path.with_suffix(suffix).unlink(missing_ok=True)
 
 
 def today_stamp(now: datetime) -> date:

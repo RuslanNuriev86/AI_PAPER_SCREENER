@@ -1,0 +1,25 @@
+# Install:
+#   cp deploy/systemd/* /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now screener-daily.timer screener-revisit.timer \
+#                        screener-feedback.timer screener-weekly.timer screener-maintenance.timer
+#
+# This host needs two uv environment variables that cannot live in uv.toml (uv 0.8.16
+# rejects `python-install-dir` as an unknown field), so they are set here as well as in the
+# .env. Without them uv fails with "Read-only file system" on this machine. See DESIGN.md §16.
+
+[Unit]
+Description=Agent Papers Daily — maturity rung probe
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# EDIT ME: the account that owns the checkout.
+User=screener
+WorkingDirectory=/opt/screener
+EnvironmentFile=/opt/screener/.env
+Environment=UV_CACHE_DIR=/opt/screener/.uv-cache
+Environment=UV_PYTHON_INSTALL_DIR=/opt/screener/.uv-python
+ExecStart=/usr/bin/uv run screener revisit
+StandardOutput=journal
+StandardError=journal

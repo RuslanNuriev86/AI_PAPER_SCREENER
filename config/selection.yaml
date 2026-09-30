@@ -1,0 +1,7 @@
+# Selection policy (§6.4). The single home for every cap and threshold.
+max_papers: 6        # 3-6 quality-gated picks; 0 is an acceptable outcome
+min_score: 6.5
+per_topic_cap: 2
+per_lab_cap: 3
+max_tag_jaccard: 0.60
+headline_score: 8.5  # exempt from per_topic_cap

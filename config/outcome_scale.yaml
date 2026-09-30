@@ -1,0 +1,16 @@
+# Outcome -> 0-10 mapping (§6.6.3). Absolute anchors, re-derived from observed cohort
+# quantiles when they drift; that is a config change recorded in config_hash, not code.
+#
+# v0 reads only t14. Note the honest constraint: citations are ~0 at two weeks and venue
+# acceptance cannot exist yet, so both are ignored at this rung rather than guessed.
+t14:
+  stars:      {9: 1000, 8: 300, 7: 150, 6: 80, 5: 30, 4: 15, 3: 5, 2: 1, 1: 0}
+  hf_upvotes: {9: 200, 7: 80, 5: 30, 3: 10, 1: 0}
+  weights: {stars: 0.5, hf_upvotes: 0.3, code_release: 0.1, revisions: 0.1}
+
+t90:
+  citations:  {9: 30, 8: 22, 7: 15, 6: 10, 5: 6, 4: 3, 3: 2, 2: 1, 1: 0}
+  weights: {citations: 0.6, influential_citations: 0.2, stars: 0.2}
+
+t180:
+  weights: {venue: 0.5, citations: 0.4, stars: 0.1}

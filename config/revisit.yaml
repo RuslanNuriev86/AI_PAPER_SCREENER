@@ -1,0 +1,16 @@
+# Maturity loop (§6.6.2). v0 ships the T+14 rung only; v1.5 adds 90 and 180. Enrolment
+# starts at v0 because outcome labels cannot be collected retroactively (§2, principle 7).
+rungs: [14]
+max_lateness_days: {14: 21, 90: 45, 180: 90}
+
+# Per-day cohort caps, applied at enrolment, stratified by score band (§6.6.1).
+cohort:
+  delivered: all
+  above_min: 20
+  mid: 20
+  low: 10
+  gate_only: 15
+
+max_resurfaced_per_digest: 1   # resurfacing itself is v2
+probe_sources: [github, hf_daily]
+window_days: 90

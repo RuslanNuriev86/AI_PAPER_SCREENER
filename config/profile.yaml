@@ -1,0 +1,59 @@
+# Interest model (§5). This file decides what is *relevant*; selection.yaml decides what is
+# printed. `per_topic_cap` deliberately has no home here — it is a selection parameter.
+name: "LLM agents & agentic systems"
+
+# Necessary but not sufficient: cs.RO only for embodied / computer-use agents.
+categories: [cs.AI, cs.CL, cs.MA, cs.LG, cs.SE, cs.CR, cs.HC, cs.RO]
+
+# > moderation lag (1-4 days); the (arxiv_id, version) seen-set handles the overlap.
+lookback_days: 5
+
+strong_terms:
+  - "LLM agent"
+  - "agentic"
+  - "tool use"
+  - "tool-use"
+  - "function calling"
+  - "computer use"
+  - "agent memory"
+  - "multi-agent LLM"
+  - "agent framework"
+  - "agent benchmark"
+  - "agentic RL"
+  - "skill library"
+  - "web agent"
+  - "SWE agent"
+  - "MCP"
+  - "trajectory"
+
+weak_terms:
+  - "agent"
+  - "planning"
+  - "reflection"
+  - "orchestration"
+  - "reasoning"
+
+# Subtractive, not absolute: two strong agentic terms survive one exclusion (§5).
+exclude_patterns:
+  - "agent-based model"
+  # Both orders: "traffic ... multi-agent" AND "multi-agent system for traffic control".
+  # One-directional matching misses the more natural phrasing.
+  - "(power grid|traffic|epidemic|market|supply chain).{0,40}multi-agent"
+  - "multi-agent.{0,40}(power grid|traffic|epidemic|market|supply chain)"
+  - "\\b(nanoparticle|pharmacological|biological|chemical) agent"
+  - "\\bRL agent\\b"
+  - "intelligent agent"
+  - "economic agent"
+
+# The closed Topic vocabulary (§6.4). Selection caps refer to exactly these strings.
+boost_topics: ["evaluation & benchmarks", "multi-agent coordination", "memory & context",
+               "computer use", "safety & oversight", "agentic RL", "infrastructure/protocols"]
+
+# Layer-1 threshold: one strong term = 2.0, one weak term = 1.0, each exclusion = -1.0.
+# 2.0 means "a weak term alone is not enough". Measured against 2,639 live arXiv papers over a
+# 5-day window: at 1.0 the gate passed 1,035 (39%), of which 498 passed on the bare word
+# "agent"; at 2.0 it passes 537 (20%), which is the funnel the cost model in §13.1 assumes.
+min_gate_score: 2.0
+
+# Injected into the review prompt as soft guidance; mined from replies by `screener eval`.
+notes: []

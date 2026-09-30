@@ -1,0 +1,19 @@
+# feedback poll timer — DESIGN.md §12.4/§12.5.
+#
+# The timezone suffix is NOT optional. systemd timers otherwise use the host's local time,
+# and this schedule is defined in ET because that is arXiv's announcement clock. Without it
+# the digest silently shifts by the host offset and the "previous evening's announcement"
+# guarantee stops being true. DST is then handled by the tz database.
+
+[Unit]
+Description=feedback poll (timer)
+
+[Timer]
+OnCalendar=*:0/15 America/New_York
+# Run once at next boot if a window was missed while the host was suspended. This is
+# systemd's equivalent of launchd's coalesce-on-wake; with the 5-day lookback and the
+# (arxiv_id, version) seen-set, a missed day self-heals on the next run.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

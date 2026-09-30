@@ -1,0 +1,11 @@
+# Keeps uv's download cache inside the project.
+#
+# Why this file exists: /root/.cache/uv is mounted read-only on this host, so `uv` fails
+# outright with "Read-only file system (os error 30)" until the cache is redirected here.
+#
+# NOTE: `python-install-dir` is deliberately NOT set here — uv 0.8.16 rejects it as an
+# unknown field in uv.toml (it is env-var/config-only: UV_PYTHON_INSTALL_DIR). Because
+# /root/.local/share/uv/python is also read-only, that variable must be exported by
+# whatever invokes uv: the Makefile for development, and EnvironmentFile=.env under
+# systemd. `make venv` is the supported entry point; see DESIGN.md §16.
+cache-dir = ".uv-cache"

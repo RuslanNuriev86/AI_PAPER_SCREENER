@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% from "item.html" import reaction_chip, review_block %}
+{% block content %}
+<h1>Papers</h1>
+{% include "period.html" %}
+{% if items %}
+<table class="wide">
+  <tr><th>day</th><th class="r">#</th><th>paper</th><th class="r">score</th><th>topics</th><th>reactions</th></tr>
+  {% for it in items %}
+  <tr>
+    <td><a href="/day/{{ it.day }}">{{ it.day }}</a></td>
+    <td class="r">{{ it.rank }}</td>
+    <td><a href="/paper/{{ it.arxiv_id }}">{{ it.title }}</a>
+        <div class="sub"><code>{{ it.arxiv_id }}</code> · {{ it.review.tldr if it.review else '' }}</div></td>
+    <td class="r"><b>{{ "%.2f"|format(it.score) }}</b></td>
+    <td>{% for t in it.topics %}<span class="tag">{{ t }}</span>{% endfor %}</td>
+    <td>{{ reaction_chip(it.reactions) }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="empty">No papers in this period.</p>{% endif %}
+{% endblock %}

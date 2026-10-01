@@ -82,21 +82,33 @@ TOPIC_ANCHORS: dict[Topic, tuple[str, ...]] = {
     "infrastructure/protocols": ("infrastructure", "protocol", "mcp", "tooling", "runtime"),
 }
 
-#: The eight rubric dimensions (§6.1).
+#: The five *judged* dimensions: the LLM reads the text and scores quality. It never sees or
+#: produces a measured signal, so it cannot hallucinate a citation count (§6.1).
+QualityDimension = Literal[
+    "relevance",
+    "novelty",
+    "rigor",
+    "evidence_strength",
+    "reproducibility",
+]
+
+#: The three *measured* dimensions: read from external sources at T+14, never inferred (§6.1).
+MeasuredDimension = Literal[
+    "citation_signal",
+    "repo_signal",
+    "venue_signal",
+]
+
 Dimension = Literal[
     "relevance",
     "novelty",
     "rigor",
     "evidence_strength",
-    "impact_forecast",
     "reproducibility",
-    "pedigree",
-    "early_signal",
+    "citation_signal",
+    "repo_signal",
+    "venue_signal",
 ]
-
-#: Dimensions that require external enrichment, therefore None at v1 (and may be None at
-#: v1.5 when a source fails). score() renormalises rather than scoring them zero (§6.5).
-ENRICHMENT_DIMENSIONS: frozenset[str] = frozenset({"pedigree", "early_signal"})
 
 
 class SoftFlag(StrEnum):
@@ -124,16 +136,36 @@ class HardFlag(StrEnum):
 
 
 #: Default rubric weights (§6.1). Sum must be exactly 1.0 — asserted by test.
+#:
+#: The measured half carries 0.45 rather than the 0.50 a clean split would give, because
+#: measurement showed what is actually there at T+14 (§6.1.0): repo stars discriminate, venue is
+#: rare, and citations are zero. `citation_signal` keeps a dimension but a small weight it will
+#: normally renormalise away, instead of a large weight that silently contributes nothing.
 RUBRIC_WEIGHTS: dict[Dimension, float] = {
-    "relevance": 0.20,
-    "novelty": 0.20,
-    "rigor": 0.15,
-    "evidence_strength": 0.10,
-    "impact_forecast": 0.20,
-    "reproducibility": 0.05,
-    "pedigree": 0.05,
-    "early_signal": 0.05,
+    # judged: 0.55
+    "relevance": 0.12,
+    "novelty": 0.16,
+    "rigor": 0.13,
+    "evidence_strength": 0.08,
+    "reproducibility": 0.06,
+    # measured: 0.45
+    "citation_signal": 0.08,
+    "repo_signal": 0.25,
+    "venue_signal": 0.12,
 }
+
+QUALITY_DIMENSIONS: tuple[QualityDimension, ...] = (
+    "relevance",
+    "novelty",
+    "rigor",
+    "evidence_strength",
+    "reproducibility",
+)
+MEASURED_DIMENSIONS: tuple[MeasuredDimension, ...] = (
+    "citation_signal",
+    "repo_signal",
+    "venue_signal",
+)
 
 #: Triage ordering weights: §6.1 renormalised over the four dimensions triage emits (§6.3).
 TRIAGE_WEIGHTS: dict[str, float] = {

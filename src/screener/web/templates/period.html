@@ -1,0 +1,14 @@
+{# Shared period selector. GET form so the range is a real, linkable URL. #}
+<form class="period" method="get" action="{{ action }}">
+  <label>from <input type="date" name="start" value="{{ start }}"></label>
+  <label>to <input type="date" name="end" value="{{ end }}"></label>
+  {% if q is defined %}<label>search <input type="search" name="q" value="{{ q }}" placeholder="title, abstract, id"></label>{% endif %}
+  {% if by is defined %}<input type="hidden" name="by" value="{{ by }}">{% endif %}
+  <button type="submit">Apply</button>
+  <span class="quick">
+    <a href="{{ action }}?start={{ (today | days_ago(7)) }}&end={{ today }}{{ extra_qs }}">7d</a>
+    <a href="{{ action }}?start={{ (today | days_ago(30)) }}&end={{ today }}{{ extra_qs }}">30d</a>
+    <a href="{{ action }}?start={{ (today | days_ago(90)) }}&end={{ today }}{{ extra_qs }}">90d</a>
+    <a href="{{ action }}?start=2000-01-01&end={{ today }}{{ extra_qs }}">all</a>
+  </span>
+</form>

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% from "item.html" import reaction_chip, review_block %}
+{% block content %}
+<h1>{{ day }}</h1>
+<p class="crumbs"><a href="/days">← all days</a></p>
+
+{% for r in runs %}
+<p class="runline">
+  <code>{{ r.run_id }}</code>
+  <span class="pill {{ r.status }}">{{ r.status }}</span>
+  fetched {{ r.fetched }} · fresh {{ r.fresh }} · gated {{ r.gated }} · reviewed {{ r.ranked }}
+  {% if r.review_failures %}<span class="bad">· {{ r.review_failures }} review failures</span>{% endif %}
+  · picked {{ r.picked }} · ${{ "%.4f"|format(r.cost_usd) }}
+  {% if r.notes %}<br><span class="note">{{ r.notes | join("; ") }}</span>{% endif %}
+</p>
+{% endfor %}
+
+{% if items %}
+  {% for it in items %}
+  <article class="paper">
+    <h2><span class="rank">#{{ it.rank }}</span>
+      <a href="/paper/{{ it.arxiv_id }}">{{ it.title }}</a>
+      <span class="score">{{ "%.2f"|format(it.score) }}</span>
+      {{ reaction_chip(it.reactions) }}
+    </h2>
+    <p class="meta">
+      <code>{{ it.arxiv_id }}v{{ it.version }}</code>
+      · <a href="{{ it.abs_url }}">arXiv</a>
+      {% if it.pdf_url %}· <a href="{{ it.pdf_url }}">PDF</a>{% endif %}
+      {% if it.code_url %}· <a href="{{ it.code_url }}">code</a>{% endif %}
+      · submitted {{ it.submitted_at[:10] }}
+      · message <code>{{ it.message_id }}</code>
+      {% if it.topics %}· {% for t in it.topics %}<span class="tag">{{ t }}</span>{% endfor %}{% endif %}
+      {% if it.soft_flags %}· {% for f in it.soft_flags %}<span class="flag">{{ f }}</span>{% endfor %}{% endif %}
+    </p>
+    {{ review_block(it.review) }}
+    <details><summary>Basis and abstract</summary>
+      <table class="basis">
+        <tr><th>dimension</th><th class="r">score</th><th class="r">weight</th><th class="r">contribution</th></tr>
+        {% for dim, value in (it.components or {}).items() %}
+        <tr><td>{{ dim }}</td>
+            <td class="r">{{ "%.1f"|format(it.payload.get(dim, 0) if it.payload else 0) }}</td>
+            <td class="r">{{ "%.3f"|format(it.effective_weights.get(dim, 0)) }}</td>
+            <td class="r">{{ "%.2f"|format(value) }}</td></tr>
+        {% endfor %}
+      </table>
+      <p class="abstract">{{ it.abstract }}</p>
+    </details>
+  </article>
+  {% endfor %}
+{% else %}
+<p class="empty">Nothing was delivered on this day.</p>
+{% endif %}
+{% endblock %}

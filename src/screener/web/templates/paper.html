@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% from "item.html" import reaction_chip, review_block %}
+{% block content %}
+<h1>{{ paper.title }}</h1>
+<p class="meta">
+  <code>{{ paper.arxiv_id }}v{{ paper.version }}</code>
+  · <a href="{{ paper.abs_url }}">arXiv</a>
+  {% if paper.pdf_url %}· <a href="{{ paper.pdf_url }}">PDF</a>{% endif %}
+  {% if paper.code_url %}· <a href="{{ paper.code_url }}">code</a>{% endif %}
+  · submitted {{ paper.submitted_at[:10] }}
+  {% if delivery %}· delivered {{ delivery.sent_at[:10] }} (rank {{ delivery.rank }}){% endif %}
+  · {{ reaction_chip(reactions) }}
+</p>
+<p class="meta">{{ paper.authors if paper.authors is string else (paper.authors | join(', ')) }}
+  {% if paper.categories %}· {{ paper.categories if paper.categories is string else (paper.categories | join(', ')) }}{% endif %}
+  {% if paper.comment %}· <i>{{ paper.comment }}</i>{% endif %}
+</p>
+
+<section class="two">
+  <div>
+    <h2>Rating</h2>
+    {% if ranking %}
+    <p class="bignum"><span class="score">{{ "%.2f"|format(ranking.score) }}</span>
+      <span class="pill {{ ranking.disposition }}">{{ ranking.disposition }}</span>
+      {% if ranking.hard_flag %}<span class="flag">{{ ranking.hard_flag }}</span>{% endif %}</p>
+    <table class="basis">
+      <tr><th>dimension</th><th class="r">judged</th><th class="r">weight</th><th class="r">contribution</th></tr>
+      {% for dim, value in components.items() %}
+      <tr><td>{{ dim }}</td>
+          <td class="r">{{ "%.1f"|format(scores.get(dim, signals.get(dim, 0))) }}</td>
+          <td class="r">{{ "%.3f"|format(weights.get(dim, 0)) }}</td>
+          <td class="r">{{ "%.2f"|format(value) }}</td></tr>
+      {% endfor %}
+    </table>
+    {% if soft_flags %}<p>{% for f in soft_flags %}<span class="flag">{{ f }}</span> {% endfor %}
+      <span class="note">each costs {{ 0.5 }} points</span></p>{% endif %}
+    {% else %}<p class="empty">Never ranked — it did not reach the review stage.</p>{% endif %}
+  </div>
+  <div>
+    <h2>Measured signals</h2>
+    {% if signals %}
+    <table>
+      {% for key in ('age_days', 'stars', 'citations', 'venue', 'repo_url') %}
+      <tr><th>{{ key }}</th><td>{{ signals.get(key) if signals.get(key) is not none else '— not measured' }}</td></tr>
+      {% endfor %}
+    </table>
+    {% if signals.get('repo_created_days_before_paper') is not none %}
+    <p class="note">repo existed {{ signals.get('repo_created_days_before_paper') }} days before the paper;
+      stars are ignored past 45 days because they are then the project's, not the paper's.</p>
+    {% endif %}
+    <p class="note">sources: {{ enrichment_sources | join(', ') or 'none' }}</p>
+    {% else %}<p class="empty">No signals were stored for this paper.</p>{% endif %}
+
+    {% if watchlist %}
+    <h2>Watchlist</h2>
+    <p>T+14 cohort {{ watchlist.cohort_date }} · band {{ watchlist.score_band }} ·
+       day-0 score {{ watchlist.day0_score }}</p>
+    {% endif %}
+    {% if outcomes %}
+    <h2>Outcome rungs</h2>
+    <table>
+      <tr><th>rung</th><th class="r">actual age</th><th>status</th><th class="r">stars</th><th class="r">citations</th><th>venue</th></tr>
+      {% for o in outcomes %}
+      <tr><td>T+{{ o.rung_days }}</td><td class="r">{{ o.actual_age_days }}</td><td>{{ o.status }}</td>
+          <td class="r">{{ o.stars if o.stars is not none else '—' }}</td>
+          <td class="r">{{ o.citations if o.citations is not none else '—' }}</td>
+          <td>{{ o.venue or '—' }}</td></tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </div>
+</section>
+
+<h2>Review</h2>
+{{ review_block(review) }}
+{% if assessment %}<p class="note">model {{ assessment.model }} · prompt {{ assessment.prompt_version }}
+  · ${{ "%.4f"|format(assessment.cost_usd or 0) }}</p>{% endif %}
+
+<h2>Abstract</h2>
+<p class="abstract">{{ paper.abstract }}</p>
+
+{% if reactions.people %}
+<h2>Readers</h2>
+<p>{{ reactions.people | join(', ') }}</p>
+{% endif %}
+{% endblock %}

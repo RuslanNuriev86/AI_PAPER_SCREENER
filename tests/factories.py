@@ -45,7 +45,9 @@ def make_paper(
         authors=["A. Author", "B. Author"],
         categories=categories or ["cs.LG", "cs.AI"],
         primary_category=(categories or ["cs.LG"])[0],
-        submitted_at=submitted_at or (NOW - timedelta(days=1)),
+        # Inside the T+14 cohort window by default (§5.2): the digest never rates day-0 papers,
+        # so a fixture that is one day old would be filtered out before the gate.
+        submitted_at=submitted_at or (NOW - timedelta(days=15)),
         abs_url=f"https://arxiv.org/abs/{arxiv_id}",
         pdf_url=f"https://arxiv.org/pdf/{arxiv_id}",
         comment=comment,

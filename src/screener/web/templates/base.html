@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Agent Papers Daily{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/">Agent Papers Daily</a>
+  <nav>
+    <a href="/" class="{{ 'on' if page == 'dashboard' }}">Dashboard</a>
+    <a href="/days" class="{{ 'on' if page == 'days' }}">By day</a>
+    <a href="/papers" class="{{ 'on' if page == 'papers' }}">Papers</a>
+    <a href="/top?by=score" class="{{ 'on' if page == 'top' }}">Top rated</a>
+    <a href="/reactions" class="{{ 'on' if page == 'reactions' }}">Reactions</a>
+  </nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>
+  Read-only view of <code>screener.db</code>. Ratings at T+14;
+  <code>q</code> = judged from text, <code>m</code> = measured from external sources.
+</footer>
+</body>
+</html>

@@ -1,0 +1,25 @@
+{# One delivered paper. Macros keep the three list views from drifting apart visually. #}
+{% macro reaction_chip(r) %}
+  {% if r and r.total %}
+    <span class="react" title="{{ r.people | join(', ') }}">
+      {% for value, n in r.emoji.items() %}{{ value }}{% if n > 1 %}×{{ n }}{% endif %} {% endfor %}
+      <b>{{ '%+d'|format(r.score) }}</b>
+    </span>
+  {% else %}<span class="react dim">no reactions</span>{% endif %}
+{% endmacro %}
+
+{% macro review_block(review) %}
+  {% if review %}
+    <p class="tldr">{{ review.tldr }}</p>
+    {% if review.what_they_did %}<p><b>What they did</b> {{ review.what_they_did }}</p>{% endif %}
+    {% if review.why_it_matters %}<p><b>Why it matters</b> {{ review.why_it_matters }}</p>{% endif %}
+    {% if review.caveats %}<p><b>Weak spot</b> {{ review.caveats }}</p>{% endif %}
+    {% if review.lenses %}<p class="tags">{% for l in review.lenses %}<span class="tag">{{ l }}</span>{% endfor %}
+      {% for t in review.tags or [] %}<span class="tag alt">{{ t }}</span>{% endfor %}</p>{% endif %}
+  {% else %}<p class="empty">No stored review for this paper.</p>{% endif %}
+{% endmacro %}
+
+{% macro score_bar(score) %}
+  <span class="score">{{
+    "%.2f"|format(score) }}</span>
+{% endmacro %}

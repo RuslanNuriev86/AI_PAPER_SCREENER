@@ -266,7 +266,10 @@ async def test_run_enrols_every_gate_passing_paper_with_a_band(repo) -> None:
     entries = repo.watchlist()
     assert len(entries) == 3
     assert {e.score_band for e in entries} == {"delivered"}
-    assert all(e.day0_impact_forecast == 8.0 for e in entries)
+    # `day0_impact_forecast` now stores the *measured* reading at the rating point, which is
+    # None when the fake source supplies no enrichment (§5.2: there is no forecast any more).
+    assert all(e.day0_impact_forecast is None for e in entries)
+    assert all(e.day0_score == pytest.approx(8.0) for e in entries)
 
 
 async def test_second_run_of_the_same_window_is_idempotent(repo) -> None:
@@ -436,19 +439,18 @@ async def test_dedupe_revisions_drops_an_already_delivered_version(repo) -> None
     paper = make_paper()
     repo.save_papers([paper])
     run_id = repo.begin_run(NOW, "h", "daily")
-    from screener.domain.models import Assessment, Ranking, Review, Scores
+    from screener.domain.models import Assessment, QualityScores, Ranking, Review
 
     review = Review(
         tldr="x",
         what_they_did="y",
         why_it_matters="z",
         caveats="w",
-        scores=Scores(
+        scores=QualityScores(
             relevance=8,
             novelty=8,
             rigor=8,
             evidence_strength=8,
-            impact_forecast=8,
             reproducibility=8,
         ),
     )
@@ -496,7 +498,7 @@ async def test_revisit_measures_a_due_rung_and_grades_it(repo) -> None:
                 cohort_date=(NOW - timedelta(days=15)).date(),
                 score_band="mid",
                 day0_score=5.5,
-                day0_impact_forecast=6.0,
+                day0_impact_forecast=None,
             )
         ]
     )
@@ -664,7 +666,7 @@ async def test_review_prose_is_persisted_so_a_digest_can_be_rebuilt(repo) -> Non
     assert result.ranked, "replay must be able to rebuild the digest from stored data"
     rebuilt = result.ranked[0].review
     assert rebuilt.tldr, "the review text must survive the round trip"
-    assert rebuilt.scores.impact_forecast is not None
+    assert rebuilt.scores.novelty is not None
 
 
 async def test_rearm_makes_only_the_shortlisted_papers_fresh_again(repo) -> None:
@@ -754,3 +756,39 @@ async def test_rearm_does_not_resurrect_a_paper_that_was_actually_sent(repo) -> 
     assert run.stats.stage_counts["fresh"] == 0, (
         "papers with a real message_id must not be re-reviewed or re-sent"
     )
+
+
+async def test_no_message_is_sent_when_nothing_clears_the_threshold(repo) -> None:
+    """A daily "0 picks" message is noise; §12.1 says send nothing and log the status."""
+    cfg = _settings()
+    cfg.selection.min_score = 99.0  # nothing can clear this
+    notifier = FakeNotifier()
+    run = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(3)),
+        llm=GoodLLM(score=8.0),
+        notifier=notifier,
+        heartbeat=FakeHeartbeat(),
+    )
+    assert run.status == "empty"
+    assert not notifier.sent, "an empty digest must not be sent"
+    assert any("min_score" in note for note in run.stats.notes)
+
+
+async def test_an_empty_digest_still_reports_being_degraded_when_it_was(repo) -> None:
+    """`degraded` outranks `empty`: an impaired run must not hide behind the quieter label."""
+    cfg = _settings()
+    cfg.selection.min_score = 99.0
+    run = await run_pipeline(
+        cfg,
+        clock=StubClock(),
+        repo=repo,
+        source=FakeSource(distinct_papers(4)),
+        llm=AlwaysFailingLLM(),
+        notifier=FakeNotifier(),
+        heartbeat=FakeHeartbeat(),
+    )
+    assert run.status == "degraded"
+    assert run.stats.stage_counts["review_failures"] == 4

@@ -1,10 +1,17 @@
 """Ranking -> Telegram-safe HTML chunks (§8).
 
-Pure. Two properties are load-bearing and therefore asserted rather than hoped for:
+Pure. Three properties are load-bearing and therefore asserted rather than hoped for:
 
 * no chunk exceeds Telegram's 4096-character limit;
 * splitting happens **on item boundaries only**, never mid-item — which is what makes the
-  item->chunk map meaningful, and that map is how a reply gets attributed to a paper (§10).
+  item->chunk map meaningful, and that map is how a reply gets attributed to a paper (§10);
+* **exactly one paper per message** (§8.4).
+
+The third is not a formatting preference. A Telegram *reaction* is attached to a message, not to
+a region of one, so a message carrying two papers makes the reaction impossible to attribute:
+there is no way to know which of them the reader meant. The digest used to pack up to five items
+per message, which meant most messages were ambiguous — in the live database four of five were.
+One paper per message makes a rating exact by construction, for reactions and replies alike.
 
 `compose` takes the papers by key rather than storing a `Paper` on every `Ranking`: a
 `Ranking` is a judgment about a paper, not a copy of it, and keeping it lean keeps the
@@ -21,7 +28,6 @@ from screener.domain.models import Digest, DigestItem, Paper, Ranking
 from screener.domain.types import PaperKey
 
 TELEGRAM_LIMIT = 4096
-MAX_ITEMS_PER_MESSAGE = 5
 
 _GATE_LABELS = {
     "pure_survey": "surveys",
@@ -105,8 +111,9 @@ def render_item(r: Ranking, paper: Paper, index: int) -> str:
         "",
         f"<b>Weak spot</b> {escape(r.review.caveats)}",
     ]
-    signals = _signals_line(r)
-    if signals:
+    if r.basis is not None:
+        lines += ["", f"<b>Basis</b> {escape(r.basis.render_compact())}"]
+    elif signals := _signals_line(r):
         lines += ["", f"<b>Signals</b> {signals}"]
     return "\n".join(lines)
 
@@ -140,7 +147,7 @@ def compose(
     best_below: float | None = None,
     unsent_notice: bool = False,
 ) -> Digest:
-    """Build the digest, splitting on item boundaries only."""
+    """Build the digest: one message per paper, so a reaction identifies a paper (§8.4)."""
     header = render_header(
         now,
         picks=len(picks),
@@ -153,29 +160,23 @@ def compose(
 
     chunks: list[str] = []
     items: list[DigestItem] = []
-    current: list[str] = [header]
-    count = 0
+    total = len(picks)
 
     for index, r in enumerate(picks, start=1):
         paper = papers.get((r.arxiv_id, r.version))
         if paper is None:
             raise KeyError(f"no Paper for {r.arxiv_id}v{r.version}; compose needs it to render")
-        block = render_item(r, paper, index)
+        parts: list[str] = []
+        if index == 1:
+            parts.append(header)  # the header rides on the first paper's message
+        parts.append(render_item(r, paper, index))
+        if index == total:
+            parts.append(footer)  # so does the footer, on the last
+        chunks.append("\n\n".join(parts))
+        items.append(DigestItem(arxiv_id=r.arxiv_id, version=r.version, chunk_index=index - 1))
 
-        # Budget for this message: the limit, minus the footer, minus join overhead.
-        projected = len("\n\n".join([*current, block])) + len(footer) + 2
-        if count and (projected > TELEGRAM_LIMIT or count >= MAX_ITEMS_PER_MESSAGE):
-            chunks.append("\n\n".join(current))
-            current = [block]
-            count = 1
-        else:
-            current.append(block)
-            count += 1
-        items.append(DigestItem(arxiv_id=r.arxiv_id, version=r.version, chunk_index=len(chunks)))
-
-    if picks:
-        current.append(footer)
-    chunks.append("\n\n".join(current))
+    if not picks:
+        chunks.append("\n\n".join([header, footer]))
 
     for i, chunk in enumerate(chunks):
         if len(chunk) > TELEGRAM_LIMIT:

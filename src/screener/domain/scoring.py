@@ -16,25 +16,8 @@ from screener.domain.types import RUBRIC_WEIGHTS
 SOFT_FLAG_PENALTY = 0.5
 
 
-def observable_dimensions(scores: object) -> dict[str, float]:
-    """The observable subset of a `Scores` object.
-
-    `pedigree` and `early_signal` are excluded when None: an unmeasured signal must not
-    silently become a low score (§6.5).
-    """
-    data: dict[str, object] = scores.model_dump()  # type: ignore[attr-defined]
-    # Absence is `None`, not "belongs to the enrichment set": a v1.5 run with a working
-    # Enricher *does* observe pedigree and early_signal, and excluding them by name would
-    # silently drop two dimensions from every score.
-    return {k: float(v) for k, v in data.items() if v is not None}  # type: ignore[arg-type]
-
-
 def effective_weights(observable: dict[str, float]) -> dict[str, float]:
-    """§6.1 weights restricted to the observable dimensions, renormalised to sum to 1.0.
-
-    At v1 this spans six dimensions; from v1.5, eight. The result is stored on the Ranking
-    as `effective_weights` so a past score stays explainable after the weights change.
-    """
+    """§6.1 weights restricted to the observed dimensions, renormalised to sum to 1.0."""
     weights = cast("dict[str, float]", RUBRIC_WEIGHTS)
     base = {dim: weights[dim] for dim in observable}
     total = sum(base.values())
@@ -44,17 +27,49 @@ def effective_weights(observable: dict[str, float]) -> dict[str, float]:
 
 
 def composite(
-    observable: dict[str, float], soft_flag_count: int = 0
+    quality: dict[str, float],
+    measured: dict[str, float] | None = None,
+    soft_flag_count: int = 0,
 ) -> tuple[float, dict[str, float], dict[str, float]]:
-    """composite = sum(w_i * dim_i) - 0.5 * len(soft_flags).
+    """Combine the two halves of the rubric (§6.1, §6.5).
 
-    Hard flags do not appear: they set `disposition='gated'`, which excludes the paper
-    outright, so penalising them here as well would double-count (§6.5).
+    Returns (score, components, effective_weights). Weights are renormalised over the dimensions
+    actually observed, so an absent measured signal shifts weight to the judged half instead of
+    scoring zero — which matters because measurement shows citations and venue are *normally*
+    absent at T+14 (§6.1.0), and a paper must not be punished for a signal that does not exist.
+
+    Hard flags do not appear here: they set `disposition='gated'`, which excludes the paper
+    outright, so penalising them as well would double-count.
     """
-    weights = effective_weights(observable)
-    components = {dim: weights[dim] * value for dim, value in observable.items()}
+    observed = {**quality, **(measured or {})}
+    if not observed:
+        raise ValueError("no observable dimensions to weight")
+    weights = effective_weights(observed)
+    components = {dim: weights[dim] * value for dim, value in observed.items()}
     score = sum(components.values()) - SOFT_FLAG_PENALTY * soft_flag_count
     return score, components, weights
+
+
+def split_halves(
+    quality: dict[str, float], measured: dict[str, float] | None
+) -> tuple[float | None, float | None, float, float]:
+    """Each half's own 0-10 mean, plus the share of total weight each actually carried.
+
+    Reported separately so the digest can say `7.8q + 6.2m` rather than one blended number: the
+    first is an opinion about text, the second is a reading from an external source.
+    """
+    measured = measured or {}
+    weights = cast("dict[str, float]", RUBRIC_WEIGHTS)
+    q_weights = {dim: weights[dim] for dim in quality}
+    m_weights = {dim: weights[dim] for dim in measured}
+    total = sum(q_weights.values()) + sum(m_weights.values())
+    if total <= 0:
+        return None, None, 0.0, 0.0
+    q_share = sum(q_weights.values()) / total
+    m_share = sum(m_weights.values()) / total
+    q_mean = sum(quality.values()) / len(quality) if quality else None
+    m_mean = sum(measured.values()) / len(measured) if measured else None
+    return q_mean, m_mean, q_share, m_share
 
 
 def _tokens(text: str) -> set[str]:

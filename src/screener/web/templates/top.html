@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% from "item.html" import reaction_chip, review_block %}
+{% block content %}
+<h1>Top rated papers</h1>
+<p class="tabs">
+  <a href="/top?by=score&start={{ start }}&end={{ end }}" class="{{ 'on' if by == 'score' }}">By the screener</a>
+  <a href="/top?by=users&start={{ start }}&end={{ end }}" class="{{ 'on' if by == 'users' }}">By readers</a>
+</p>
+{% include "period.html" %}
+
+{% if by == 'score' %}
+  {% if items %}
+  <table class="wide">
+    <tr><th class="r">#</th><th>paper</th><th class="r">score</th><th>day</th><th>reactions</th></tr>
+    {% for it in items %}
+    <tr>
+      <td class="r">{{ loop.index }}</td>
+      <td><a href="/paper/{{ it.arxiv_id }}">{{ it.title }}</a>
+          <div class="sub"><code>{{ it.arxiv_id }}</code> · {{ it.review.tldr if it.review else '' }}</div></td>
+      <td class="r"><b>{{ "%.2f"|format(it.score) }}</b></td>
+      <td><a href="/day/{{ it.day }}">{{ it.day }}</a></td>
+      <td>{{ reaction_chip(it.reactions) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="empty">Nothing delivered in this period.</p>{% endif %}
+{% else %}
+  {% if items %}
+  <table class="wide">
+    <tr><th class="r">#</th><th>paper</th><th class="r">reader score</th><th class="r">users</th><th class="r">reactions</th><th>emoji</th><th>last</th></tr>
+    {% for it in items %}
+    <tr>
+      <td class="r">{{ loop.index }}</td>
+      <td><a href="/paper/{{ it.arxiv_id }}">{{ it.title }}</a></td>
+      <td class="r"><b>{{ '%+d'|format(it.user_score or 0) }}</b></td>
+      <td class="r">{{ it.users }}</td>
+      <td class="r">{{ it.reactions }}</td>
+      <td class="emoji">{{ it.emoji | join(' ') }}</td>
+      <td>{{ it.last_seen }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="empty">No reactions in this period.
+    {% if not overview.reactions %}Reactions require the bot to be an <b>administrator</b> of the group — Telegram does not deliver
+    <code>message_reaction</code> updates to a plain member. Written replies to a digest message are captured either way.{% endif %}
+  </p>
+  {% endif %}
+{% endif %}
+{% endblock %}

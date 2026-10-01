@@ -12,7 +12,6 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from screener.domain.types import (
-    ENRICHMENT_DIMENSIONS,
     RUBRIC_WEIGHTS,
     HardFlag,
     Lens,
@@ -89,12 +88,22 @@ class GateResult(BaseModel):
 
 
 class Enrichment(BaseModel):
+    """What the adapters actually read at the rating point (§6.1). Never inferred."""
+
     arxiv_id: str
+    #: The paper version these signals belong to. `enrichment` is keyed including the version, so
+    #: defaulting it would file a revised paper's signals against its first version.
+    version: int = 1
     citations: int | None = None
     influential_citations: int | None = None
     hf_upvotes: int | None = None
     hf_daily_rank: int | None = None
     stars: int | None = None
+    repo_url: str | None = None
+    #: How long before the paper the repo already existed. A repo older than
+    #: `signals.REPO_YOUNG_DAYS` is someone else's project, so its stars are not this paper's
+    #: traction — the 34,432-star repo in the T+30 sample (§6.1.0) is exactly that case.
+    repo_created_days_before_paper: int | None = None
     institutions: list[str] | None = None
     venue: str | None = None
     sources_ok: list[str] = Field(default_factory=list)
@@ -127,21 +136,69 @@ class TriageScores(BaseModel):
 # --------------------------------------------------------------------------------------
 
 
-class Scores(BaseModel):
-    """§6.1 rubric. `None` means *unobservable*, not zero — see `rank()`."""
+class QualityScores(BaseModel):
+    """The judged half of the rubric (§6.1) — the LLM's half, and only its half.
+
+    The model never sees citation counts or star counts and cannot emit them, so a measured
+    signal cannot be hallucinated into the rating. Those live in `SignalScores`, which only an
+    adapter can populate.
+    """
 
     relevance: float = Field(ge=0, le=10)
     novelty: float = Field(ge=0, le=10)
     rigor: float = Field(ge=0, le=10)
     evidence_strength: float = Field(ge=0, le=10)
-    impact_forecast: float = Field(ge=0, le=10)
     reproducibility: float = Field(ge=0, le=10)
-    pedigree: float | None = None
-    early_signal: float | None = None
 
     def observable(self) -> dict[str, float]:
-        data = self.model_dump()
-        return {k: float(v) for k, v in data.items() if v is not None}
+        return {k: float(v) for k, v in self.model_dump().items() if v is not None}
+
+
+class SignalScores(BaseModel):
+    """The measured half of the rubric (§6.1), plus the raw values it came from.
+
+    `None` means *not measured*, which is not the same as zero and is renormalised away rather
+    than scored (§6.5). At T+14 that is the normal case for citations and venue: measurement
+    showed zero cited papers and no venue in every cohort sampled (§6.1.0).
+    """
+
+    arxiv_id: str
+    age_days: int
+    citation_signal: float | None = None
+    repo_signal: float | None = None
+    venue_signal: float | None = None
+    # Raw values, so the digest can print what was actually read rather than a score alone.
+    citations: int | None = None
+    stars: int | None = None
+    venue: str | None = None
+    repo_url: str | None = None
+    sources_ok: list[str] = Field(default_factory=list)
+
+    def observable(self) -> dict[str, float]:
+        return {
+            dim: float(v)
+            for dim, v in (
+                ("citation_signal", self.citation_signal),
+                ("repo_signal", self.repo_signal),
+                ("venue_signal", self.venue_signal),
+            )
+            if v is not None
+        }
+
+    def describe(self) -> list[str]:
+        """The raw evidence, as the reader should see it — with age, and absence made visible."""
+        bits: list[str] = []
+        if self.stars is not None:
+            bits.append(f"{self.stars}★ repo")
+        elif self.repo_url:
+            bits.append("repo, no stars read")
+        else:
+            bits.append("no repo linked")
+        bits.append(
+            f"{self.citations} citations" if self.citations is not None else "citations unread"
+        )
+        bits.append(f"{self.venue}" if self.venue else "no venue yet")
+        return bits
 
 
 def truncate_prose(value: str, limit: int) -> str:
@@ -189,7 +246,7 @@ class Review(BaseModel):
     lenses: list[Lens] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     evidence_quotes: list[str] = Field(default_factory=list)
-    scores: Scores
+    scores: QualityScores
     soft_flags: list[SoftFlag] = Field(default_factory=list)
     hard_flag: HardFlag | None = None
 
@@ -239,7 +296,7 @@ class Assessment(BaseModel):
     created_at: datetime
     cost_usd: float = 0.0
     triage: TriageScores | None = None
-    scores: Scores | None = None
+    scores: QualityScores | None = None
     review: Review | None = None
     verdict: VerifyVerdict | None = None
     soft_flags: list[SoftFlag] = Field(default_factory=list)
@@ -249,6 +306,63 @@ class Assessment(BaseModel):
 # --------------------------------------------------------------------------------------
 # Stage 6 — rank and select
 # --------------------------------------------------------------------------------------
+
+
+class RatingBasis(BaseModel):
+    """Why a paper scored what it scored (§7.3).
+
+    Deliberately keeps the two halves apart. The judged half is an opinion about text; the
+    measured half is a reading from an external source with a timestamp. Printing them as one
+    blended number is how a rating becomes unfalsifiable, so the render methods never do.
+
+    There is no `impact_forecast` anywhere: with the rating point at T+14 there is no predicted
+    impact to disclose, which removes the whole class of "the model thinks this will be big"
+    claims from the digest (§5.2).
+    """
+
+    age_days: int
+    quality: QualityScores | None = None
+    signals: SignalScores | None = None
+    quality_score: float | None = None  # judged half, 0-10
+    measured_score: float | None = None  # measured half, 0-10
+    quality_weight: float = 0.0  # renormalised share actually applied
+    measured_weight: float = 0.0
+    components: dict[str, float] = Field(default_factory=dict)
+    effective_weights: dict[str, float] = Field(default_factory=dict)
+    soft_flags: list[SoftFlag] = Field(default_factory=list)
+    soft_flag_penalty: float = 0.0
+
+    def render_compact(self) -> str:
+        """One line for the digest, naming both halves and the raw evidence behind the second."""
+        parts = [f"{self.quality_score:.1f}q" if self.quality_score is not None else "—q"]
+        parts.append(f"{self.measured_score:.1f}m" if self.measured_score is not None else "—m")
+        head = " + ".join(parts)
+        evidence = ", ".join(self.signals.describe()) if self.signals else "no signals read"
+        tail = f" - {self.soft_flag_penalty:.1f} flags" if self.soft_flag_penalty else ""
+        return f"{head} ({self.age_days}d) · {evidence}{tail}"
+
+    def render_full(self) -> str:
+        """The breakdown for `screener explain`: every dimension, weight and contribution."""
+        lines = [f"age at rating: T+{self.age_days}"]
+        if self.quality is not None:
+            lines.append(f"judged half (weight {self.quality_weight:.2f}):")
+            for dim, raw in self.quality.model_dump().items():
+                weight = self.effective_weights.get(dim, 0.0)
+                lines.append(f"  {dim:<18} {raw:>4.1f} x {weight:.3f} = {raw * weight:>5.2f}")
+        if self.signals is not None:
+            lines.append(f"measured half (weight {self.measured_weight:.2f}):")
+            for dim, raw in self.signals.observable().items():
+                weight = self.effective_weights.get(dim, 0.0)
+                lines.append(f"  {dim:<18} {raw:>4.1f} x {weight:.3f} = {raw * weight:>5.2f}")
+            lines.append("  evidence: " + ", ".join(self.signals.describe()))
+            lines.append(f"  sources: {', '.join(self.signals.sources_ok) or 'none'}")
+        if self.soft_flag_penalty:
+            lines.append(
+                f"penalty: -{self.soft_flag_penalty:.1f} for {len(self.soft_flags)} flag(s): "
+                + ", ".join(f.value for f in self.soft_flags)
+            )
+        lines.append(f"composite: {sum(self.components.values()) - self.soft_flag_penalty:.2f}")
+        return "\n".join(lines)
 
 
 class Ranking(BaseModel):
@@ -267,6 +381,8 @@ class Ranking(BaseModel):
     topics: list[Topic] = Field(default_factory=list)
     lab: str | None = None
     tags: list[str] = Field(default_factory=list)
+    signals: SignalScores | None = None
+    basis: RatingBasis | None = None
 
     @property
     def key(self) -> PaperKey:
@@ -418,18 +534,56 @@ class RevisitRun(BaseModel):
 
 
 class OutcomeScale(BaseModel):
-    """config/outcome_scale.yaml (§6.6.3). v0 uses the T+14 stars/upvotes mapping only."""
+    """Raw measured value -> 0-10, with written anchors (§6.1.1).
 
-    stars: dict[int, int] = Field(default_factory=lambda: {9: 1000, 7: 150, 5: 30, 3: 5, 1: 0})
-    hf_upvotes: dict[int, int] = Field(default_factory=lambda: {9: 200, 7: 80, 5: 30, 3: 10, 1: 0})
+    The T+14 anchors are deliberately compressed relative to a mature-paper scale: a naive
+    "50 citations is a 9" would score every T+14 paper between 0 and 1 and flatten the measured
+    half to noise. Re-derive from observed cohort quantiles rather than intuition.
+    """
+
+    #: Stars at T+14. Measured sample: 7, 4, 2 across the ~10% of papers with a findable repo.
+    stars: dict[int, int] = Field(
+        default_factory=lambda: {10: 200, 9: 120, 8: 60, 7: 30, 6: 15, 5: 8, 4: 4, 3: 2, 1: 0}
+    )
+    #: Citations at T+14. Measured zero for every cohort sampled (§6.1.0); the anchors exist so
+    #: the T+90 rung can carry this dimension once a source that merges preprint and published
+    #: records is wired in.
+    citations: dict[int, int] = Field(
+        default_factory=lambda: {10: 20, 9: 12, 8: 8, 7: 5, 6: 3, 5: 2, 3: 1, 1: 0}
+    )
+    hf_upvotes: dict[int, int] = Field(default_factory=lambda: {9: 100, 7: 40, 5: 15, 3: 5, 1: 0})
     weights: dict[str, float] = Field(
+        default_factory=lambda: {"stars": 0.55, "citations": 0.25, "venue": 0.20}
+    )
+    #: Substring -> score, first match wins. A stated acceptance is decisive when present, and
+    #: measured absent in every T+14 cohort, so it renormalises away rather than scoring zero.
+    venue_markers: dict[str, int] = Field(
         default_factory=lambda: {
-            "stars": 0.5,
-            "hf_upvotes": 0.3,
-            "code_release": 0.1,
-            "revisions": 0.1,
+            "neurips": 10,
+            "nips": 10,
+            "icml": 10,
+            "iclr": 10,
+            "cvpr": 10,
+            "iccv": 10,
+            "osdi": 10,
+            "sosp": 10,
+            "acl": 9,
+            "emnlp": 9,
+            "naacl": 9,
+            "eccv": 9,
+            "aaai": 9,
+            "kdd": 9,
+            "icse": 9,
+            "fse": 9,
+            "ijcai": 8,
+            "www": 8,
+            "sigir": 8,
+            "accepted": 8,
+            "to appear": 8,
+            "journal": 7,
         }
     )
+    venue_default: int = 6
 
 
 class CalibrationReport(BaseModel):
@@ -454,6 +608,12 @@ class Profile(BaseModel):
     weak_terms: list[str] = Field(default_factory=list)
     exclude_patterns: list[str] = Field(default_factory=list)
     boost_topics: list[Topic] = Field(default_factory=list)
+    #: The rating point (§5.2). The cohort is the papers that have just reached this age, never
+    #: day-0 papers: at T+14 the impact signals are measurable facts rather than forecasts.
+    cohort_age_days: int = 14
+    #: How far back the cohort window reaches, so a missed day self-heals rather than silently
+    #: losing a paper's only rating opportunity.
+    catch_up_days: int = 2
     lookback_days: int = 5
     #: Minimum relevance-hint score for layer 1 to pass a paper (§5). One strong term scores
     #: 2.0, one weak term 1.0, and each exclusion subtracts 1.0 — so a default of 2.0 means
@@ -486,7 +646,6 @@ def default_weights() -> dict[str, float]:
 
 
 __all__ = [
-    "ENRICHMENT_DIMENSIONS",
     "Assessment",
     "CalibrationReport",
     "Digest",
@@ -500,15 +659,17 @@ __all__ = [
     "Paper",
     "Profile",
     "Prompt",
+    "QualityScores",
     "Ranking",
+    "RatingBasis",
     "RelevanceHint",
     "Review",
     "RevisitConfig",
     "RevisitRun",
     "Run",
     "RunStats",
-    "Scores",
     "Selection",
+    "SignalScores",
     "TriageScores",
     "VerifyVerdict",
     "WatchlistEntry",

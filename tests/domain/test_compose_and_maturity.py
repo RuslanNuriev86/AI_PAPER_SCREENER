@@ -30,10 +30,10 @@ from screener.domain.models import (
     Assessment,
     OutcomeScale,
     OutcomeSignal,
+    QualityScores,
     Ranking,
     Review,
     RevisitConfig,
-    Scores,
     WatchlistEntry,
 )
 from tests.factories import make_paper
@@ -50,12 +50,11 @@ def _ranking(i: int, *, score: float = 8.0, tldr_words: int = 12) -> Ranking:
         caveats="Limited to three web benchmarks.",
         lenses=["method"],
         tags=["evaluation & benchmarks"],
-        scores=Scores(
+        scores=QualityScores(
             relevance=7,
             novelty=7,
             rigor=6,
             evidence_strength=6,
-            impact_forecast=7,
             reproducibility=5,
         ),
     )
@@ -375,3 +374,56 @@ def test_a_paper_with_no_urls_emits_no_empty_href() -> None:
     assert "abs</a>" not in html
     assert bare.arxiv_id in html
     assert not _check_html(html)
+
+
+def test_each_paper_gets_its_own_message() -> None:
+    """§8.4: a reaction is attached to a message, so a message must hold one paper.
+
+    The digest used to pack up to five items per message; four of the five messages in the live
+    database carried two papers, which made every reaction on them unplaceable.
+    """
+    picks = [_ranking(i) for i in range(6)]
+    # Distinct titles, or "no other paper appears here" would be vacuously true: the factory
+    # gives every paper the same title by default.
+    papers = {
+        (r.arxiv_id, 1): make_paper(arxiv_id=r.arxiv_id, title=f"Distinct Paper {i}")
+        for i, r in enumerate(picks)
+    }
+    digest = compose(picks, papers, NOW, scanned=10, relevant=10, cost_usd=0.0)
+
+    assert len(digest.chunks) == len(picks), "one message per paper"
+    for item in digest.items:
+        chunk = digest.chunks[item.chunk_index]
+        assert f"Distinct Paper {item.chunk_index}" in chunk
+        # No other paper's title may appear in this paper's message.
+        for other in range(len(picks)):
+            if other != item.chunk_index:
+                assert f"Distinct Paper {other}" not in chunk
+
+
+def test_the_header_rides_on_the_first_message_and_the_footer_on_the_last() -> None:
+    picks = [_ranking(i) for i in range(3)]
+    papers = {(r.arxiv_id, 1): make_paper(arxiv_id=r.arxiv_id) for r in picks}
+    digest = compose(
+        picks,
+        papers,
+        NOW,
+        scanned=90,
+        relevant=12,
+        cost_usd=0.03,
+        gated_by_reason={"pure_survey": 4},
+    )
+    assert "Agent Papers" in digest.chunks[0]
+    assert "Agent Papers" not in digest.chunks[1]
+    assert "surveys" in digest.chunks[-1]
+    assert "surveys" not in digest.chunks[0]
+
+
+def test_no_message_ever_carries_two_papers() -> None:
+    """The invariant the reaction attribution depends on, stated directly."""
+    picks = [_ranking(i) for i in range(9)]
+    papers = {(r.arxiv_id, 1): make_paper(arxiv_id=r.arxiv_id) for r in picks}
+    digest = compose(picks, papers, NOW, scanned=10, relevant=10, cost_usd=0.0)
+    for item in digest.items:
+        same = [i.arxiv_id for i in digest.items if i.chunk_index == item.chunk_index]
+        assert same == [item.arxiv_id], f"message {item.chunk_index} carries {same}"

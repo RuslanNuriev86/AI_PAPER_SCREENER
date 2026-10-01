@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Overall statistics</h1>
+<section class="cards">
+  <div class="card"><span class="n">{{ "{:,}".format(overview.papers) }}</span><span class="l">papers fetched</span></div>
+  <div class="card"><span class="n">{{ "{:,}".format(overview.gated) }}</span><span class="l">passed the gate</span></div>
+  <div class="card"><span class="n">{{ overview.delivered }}</span><span class="l">delivered</span></div>
+  <div class="card"><span class="n">{{ overview.runs }}</span><span class="l">runs</span></div>
+  <div class="card"><span class="n">${{ "%.4f"|format(overview.cost_usd) }}</span><span class="l">total spend</span></div>
+  <div class="card"><span class="n">{{ overview.reactions }}</span><span class="l">reactions</span></div>
+  <div class="card"><span class="n">{{ overview.reaction_users }}</span><span class="l">reacting users</span></div>
+  <div class="card"><span class="n">{{ overview.replies }}</span><span class="l">written replies</span></div>
+</section>
+
+<section class="two">
+  <div>
+    <h2>Run outcomes</h2>
+    <table>
+      <tr><th>status</th><th class="r">runs</th></tr>
+      {% for status, n in overview.status_counts.items() %}
+      <tr><td><span class="pill {{ status }}">{{ status }}</span></td><td class="r">{{ n }}</td></tr>
+      {% endfor %}
+    </table>
+    {% if overview.emoji_totals %}
+    <h2>Reactions by emoji</h2>
+    <table>
+      {% for value, n in overview.emoji_totals.items() %}
+      <tr><td class="emoji">{{ value }}</td><td class="r">{{ n }}</td></tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </div>
+  <div>
+    <h2>Readers</h2>
+    {% if overview.ratings_by_user %}
+    <table>
+      <tr><th>user</th><th class="r">score</th><th class="r">reactions</th><th class="r">replies</th></tr>
+      {% for name, r in overview.ratings_by_user.items() %}
+      <tr><td>{{ name }}</td><td class="r">{{ r.score }}</td><td class="r">{{ r.reactions }}</td><td class="r">{{ r.replies }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="empty">No feedback yet. Reactions need the bot to be an administrator of the group; written replies work either way.</p>
+    {% endif %}
+  </div>
+</section>
+
+<h2>Digests by day</h2>
+{% if days %}
+<table>
+  <tr><th>day</th><th class="r">papers</th><th class="r">messages</th><th class="r">best</th><th class="r">mean</th><th class="r">cost</th><th class="r">reactions</th></tr>
+  {% for d in days %}
+  <tr>
+    <td><a href="/day/{{ d.day }}">{{ d.day }}</a></td>
+    <td class="r">{{ d.papers }}</td><td class="r">{{ d.messages }}</td>
+    <td class="r">{{ d.best_score }}</td><td class="r">{{ d.mean_score }}</td>
+    <td class="r">${{ "%.4f"|format(d.cost_usd) }}</td><td class="r">{{ d.reactions }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="empty">No digests delivered yet.</p>{% endif %}
+
+<h2>Runs</h2>
+<table>
+  <tr><th>run</th><th>day</th><th>status</th><th class="r">fetched</th><th class="r">fresh</th>
+      <th class="r">gated</th><th class="r">reviewed</th><th class="r">failed</th><th class="r">picked</th><th class="r">cost</th><th>notes</th></tr>
+  {% for r in funnel %}
+  <tr>
+    <td><code>{{ r.run_id }}</code></td><td>{{ r.day }}</td>
+    <td><span class="pill {{ r.status }}">{{ r.status }}</span></td>
+    <td class="r">{{ r.fetched }}</td><td class="r">{{ r.fresh }}</td><td class="r">{{ r.gated }}</td>
+    <td class="r">{{ r.ranked }}</td>
+    <td class="r {{ 'bad' if r.review_failures }}">{{ r.review_failures }}</td>
+    <td class="r">{{ r.picked }}</td><td class="r">${{ "%.4f"|format(r.cost_usd) }}</td>
+    <td class="note">{{ r.notes | join("; ") }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

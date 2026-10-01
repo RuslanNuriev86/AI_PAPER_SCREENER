@@ -10,10 +10,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 import structlog
 
 from screener.adapters.arxiv import ArxivSource
+from screener.adapters.enrich import Enricher
 from screener.adapters.heartbeat import HttpHeartbeat, NullHeartbeat
 from screener.adapters.llm import OpenAILikeLLM
 from screener.adapters.probe import GithubStarsProbe, OutcomeProbe
@@ -37,6 +39,7 @@ class Deps:
     settings: Settings
     repo: SqliteRepository
     source: ArxivSource
+    enricher: Enricher
     llm: OpenAILikeLLM
     notifier: TelegramNotifier
     heartbeat: HttpHeartbeat | NullHeartbeat
@@ -45,6 +48,7 @@ class Deps:
 
     async def aclose(self) -> None:
         await self.source.aclose()
+        await self.enricher.aclose()
         await self.llm.aclose()
         await self.notifier.aclose()
         await self.heartbeat.aclose()
@@ -93,7 +97,8 @@ async def build_deps(cfg: Settings, *, require_network: bool = True) -> AsyncIte
     llm = OpenAILikeLLM(
         cfg.llm_api_key or "unused", base_url=cfg.llm_base_url, thinking=cfg.llm_thinking
     )
-    source = ArxivSource(cfg.contact_email)
+    source = ArxivSource(cfg.contact_email, cache_dir=Path(cfg.screener_cache) / "arxiv")
+    enricher = Enricher(cfg.contact_email, github_token=cfg.github_token or None)
     notifier = TelegramNotifier(cfg.telegram_bot_token or "unused", cfg.telegram_chat_id or "0")
     heartbeat = HttpHeartbeat(cfg.heartbeat_url) if cfg.heartbeat_url else NullHeartbeat()
     probe = OutcomeProbe(GithubStarsProbe(cfg.github_token or None))
@@ -102,6 +107,7 @@ async def build_deps(cfg: Settings, *, require_network: bool = True) -> AsyncIte
         settings=cfg,
         repo=repo,
         source=source,
+        enricher=enricher,
         llm=llm,
         notifier=notifier,
         heartbeat=heartbeat,

@@ -15,13 +15,28 @@ from screener.ports import PaperSource, Repository
 log = structlog.get_logger(__name__)
 
 
+def cohort_window(profile: Profile, now: datetime) -> tuple[datetime, datetime]:
+    """The T+14 window (§5.2): `[now - (age + catch_up), now - age]`.
+
+    Deliberately not "the last N days". The rating point is the product decision, and the fetch
+    window is derived from it so the two cannot drift apart.
+    """
+    age = profile.cohort_age_days
+    until = now - timedelta(days=age)
+    since = until - timedelta(days=profile.catch_up_days)
+    return since, until
+
+
 async def fetch(
     source: PaperSource, profile: Profile, now: datetime
 ) -> tuple[list[Paper], datetime, datetime]:
-    """Fetch the sliding window. Returns (papers, since, until)."""
-    since = now - timedelta(days=profile.lookback_days)
-    papers = await source.fetch(since, now, profile)
-    return papers, since, now
+    """Fetch the T+14 cohort. Returns (papers, since, until)."""
+    since, until = cohort_window(profile, now)
+    papers = await source.fetch(since, until, profile)
+    # The source window is a submission-date range; announce lag means a paper inside it may be
+    # younger than the rating point, so it is filtered out rather than rated early.
+    papers = [p for p in papers if (now - p.submitted_at).days >= profile.cohort_age_days]
+    return papers, since, until
 
 
 def dedupe_revisions(papers: list[Paper], repo: Repository) -> list[Paper]:

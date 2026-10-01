@@ -20,9 +20,12 @@ from datetime import datetime
 from importlib import resources
 from pathlib import Path
 
+import structlog
+
 from screener.domain.models import (
     Assessment,
     CalibrationReport,
+    Enrichment,
     GateResult,
     LedgerEntry,
     Outcome,
@@ -75,8 +78,26 @@ class SqliteRepository:
     # -- lifecycle ---------------------------------------------------------------------
 
     def migrate(self) -> None:
-        sql = resources.files("screener.migrations").joinpath("001_init.sql").read_text()
-        self._conn.executescript(sql)
+        """Apply every migration newer than `PRAGMA user_version`, in order, exactly once.
+
+        The original version replayed a single file behind `CREATE TABLE IF NOT EXISTS`, which
+        cannot express a schema *change* — and adding the reacting user to `feedback` is one.
+        Replaying 001 on an existing database stays safe because all of its DDL is
+        `IF NOT EXISTS`, so databases created before this runner pick up cleanly from 0.
+        """
+        applied = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        migrations = sorted(
+            (int(entry.name.split("_", 1)[0]), entry)
+            for entry in resources.files("screener.migrations").iterdir()
+            if entry.name.endswith(".sql") and entry.name.split("_", 1)[0].isdigit()
+        )
+        for version, entry in migrations:
+            if version <= applied:
+                continue
+            self._conn.executescript(entry.read_text())
+            self._conn.execute(f"PRAGMA user_version = {version}")
+            self._conn.commit()
+            log.info("db.migrated", version=version, file=entry.name)
 
     def close(self) -> None:
         self._conn.close()
@@ -439,7 +460,42 @@ class SqliteRepository:
             (key, value, datetime.now().astimezone().isoformat()),
         )
 
+    def save_enrichment(self, enrichments: Sequence[Enrichment], now: datetime) -> None:
+        """Persist what was read for each paper at the rating point.
+
+        Without this a rating cannot be reconstructed later: the digest prints its basis (§7.3),
+        but the basis was only ever rendered in memory, so `explain` could show the judged half
+        and nothing else.
+        """
+        for e in enrichments:
+            self._conn.execute(
+                "INSERT INTO enrichment (arxiv_id, version, source, payload, fetched_at)"
+                " VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING",
+                (
+                    e.arxiv_id,
+                    e.version,
+                    "signals",
+                    json.dumps(e.model_dump(mode="json")),
+                    now.isoformat(),
+                ),
+            )
+        self._conn.commit()
+
     # -- feedback (§8.3) ---------------------------------------------------------------
+
+    def papers_in_message(self, message_id: str) -> list[str]:
+        """Every paper a message carried, in rank order.
+
+        Needed because one message routinely carries two papers, and a Telegram *reaction* is
+        attached to a message, not to a region of it. Attributing such a reaction to a single
+        paper is a guess, and guessing silently corrupts the reader ranking.
+        """
+        return [
+            str(r["arxiv_id"])
+            for r in self._conn.execute(
+                "SELECT arxiv_id FROM deliveries WHERE message_id=? ORDER BY rank", (message_id,)
+            ).fetchall()
+        ]
 
     def delivery_by_message(self, message_id: str) -> tuple[str | None, str | None] | None:
         """message_id -> (run_id, arxiv_id).
@@ -456,6 +512,15 @@ class SqliteRepository:
             return None
         return str(row["run_id"]), str(row["arxiv_id"])
 
+    def remove_feedback(self, message_id: str, arxiv_id: str, kind: str, tg_user_id: int) -> int:
+        """Drop a user's feedback on one paper — used when a reaction is taken back."""
+        cur = self._conn.execute(
+            "DELETE FROM feedback WHERE message_id=? AND arxiv_id=? AND kind=? AND tg_user_id=?",
+            (message_id, arxiv_id, kind, tg_user_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def add_feedback(
         self,
         *,
@@ -465,12 +530,25 @@ class SqliteRepository:
         kind: str,
         value: str,
         created_at: datetime,
+        tg_user_id: int = 0,
+        tg_user_name: str | None = None,
     ) -> None:
         self._conn.execute(
-            "INSERT INTO feedback (message_id, run_id, arxiv_id, kind, value, created_at)"
-            " VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING",
-            (message_id, run_id, arxiv_id, kind, value, created_at.isoformat()),
+            "INSERT INTO feedback"
+            " (message_id, run_id, arxiv_id, kind, value, tg_user_id, tg_user_name, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+            (
+                message_id,
+                run_id,
+                arxiv_id,
+                kind,
+                value,
+                tg_user_id,
+                tg_user_name,
+                created_at.isoformat(),
+            ),
         )
+        self._conn.commit()
 
     # -- diagnostics -------------------------------------------------------------------
 
@@ -511,6 +589,9 @@ def _paper_from_row(r: sqlite3.Row) -> Paper:
         code_url=str(r["code_url"]) if r["code_url"] else None,
         first_seen_at=datetime.fromisoformat(str(r["first_seen_at"])),
     )
+
+
+log = structlog.get_logger(__name__)
 
 
 def iter_paper_keys(papers: Iterable[Paper]) -> list[PaperKey]:

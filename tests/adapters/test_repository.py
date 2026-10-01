@@ -16,10 +16,10 @@ import pytest
 from screener.adapters.sqlite_repo import SqliteRepository
 from screener.domain.models import (
     GateResult,
+    QualityScores,
     Ranking,
     RelevanceHint,
     Review,
-    Scores,
     WatchlistEntry,
 )
 from screener.domain.relevance import gate
@@ -36,12 +36,11 @@ def _review() -> Review:
         caveats="Only one benchmark.",
         lenses=["method"],
         tags=["memory & context"],
-        scores=Scores(
+        scores=QualityScores(
             relevance=7,
             novelty=7,
             rigor=6,
             evidence_strength=6,
-            impact_forecast=7,
             reproducibility=5,
         ),
     )

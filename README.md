@@ -29,9 +29,10 @@ One run against live arXiv (5-day window, 8 categories):
 
 | Stage | Result |
 |---|---|
-| scanned | **2,635** papers |
-| gate-passing | **530** (20.1%) |
+| scanned | **3,679** papers (10 arXiv requests, 33 s cold / 0.07 s cached) |
+| gate-passing | **196–530** depending on the day (≈5–20%) |
 | reviewed | **16** (capped by `review_top_k`) |
+| delivered | **4 picks in 2 messages**, $0.016 |
 | second run | **0 fresh** — the seen-set makes the window idempotent |
 
 The design doc's original estimate was ~250 scanned / ~50 gated, so the funnel was ~10×
@@ -117,9 +118,36 @@ a non-existent user chat, and that is the single most common cause of this error
 | `screener replay --date` | rebuild a digest from stored data (no network, no send) |
 | `screener replay --date --write-outbox` | rebuild a digest and park it for the next run to send |
 | `screener rearm --date` | make a day's reviewed papers fresh again (recovery, see below) |
+| `screener web` | browse what was found, delivered and rated at http://127.0.0.1:8765 |
+| `screener explain <id>` | print exactly why one paper scored what it scored |
 | `screener backtest --since` | re-score stored rankings under candidate weights |
 | `screener feedback` | poll Telegram for replies (text only — see below) |
 | `screener eval` / `prune` / `stats` | maturity coverage, retention, row counts |
+
+## Browsing what happened
+
+```bash
+screener web                 # http://127.0.0.1:8765
+screener web --port 9000
+```
+
+Read-only and localhost-only: it opens the database with `mode=ro`, so it can never write, and it
+refuses a non-loopback bind unless you pass `--allow-remote` (there is no authentication, so a
+public bind publishes your whole paper history). To reach it from elsewhere, tunnel:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 your-host
+```
+
+Pages: overall statistics and per-run funnels; digests by day with each item's review, rating
+basis and reactions; searchable papers over any period; top-rated by the screener; top-rated *by
+readers*; and a per-paper page showing the full rating arithmetic and measured signals.
+
+**Reader reactions need the bot to be an administrator** of the group — Telegram does not deliver
+`message_reaction` updates to a plain member. The subscription is already enabled, so promoting
+`PaperScreener26_bot` in *ai_papers* (Group settings → Administrators) is the only step needed;
+written replies are captured either way. `screener feedback` polls every 15 minutes under its
+systemd timer.
 
 ## When a digest is reviewed but never delivered
 

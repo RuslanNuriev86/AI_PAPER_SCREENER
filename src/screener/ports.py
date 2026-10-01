@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from screener.domain.models import (
     Assessment,
     CalibrationReport,
+    Enrichment,
     GateResult,
     LedgerEntry,
     Outcome,
@@ -53,7 +54,7 @@ class PaperSource(Protocol):
 
 @runtime_checkable
 class Enricher(Protocol):
-    async def enrich(self, papers: Sequence[Paper]) -> Mapping[str, object]: ...
+    async def enrich(self, papers: Sequence[Paper]) -> Mapping[str, Enrichment]: ...
 
 
 @runtime_checkable
@@ -128,10 +129,34 @@ class Repository(Protocol):
     def get_state(self, key: str) -> str | None: ...
     def set_state(self, key: str, value: str) -> None: ...
 
+    # --- measured signals and reader feedback (§6.1, §8.3) ---
+    def save_enrichment(self, enrichments: Sequence[Enrichment], now: datetime) -> None: ...
+    def delivery_by_message(self, message_id: str) -> tuple[str | None, str | None] | None: ...
+    def papers_in_message(self, message_id: str) -> list[str]: ...
+    def add_feedback(
+        self,
+        *,
+        message_id: str,
+        run_id: str,
+        arxiv_id: str,
+        kind: str,
+        value: str,
+        created_at: datetime,
+        tg_user_id: int = 0,
+        tg_user_name: str | None = None,
+    ) -> None: ...
+    def remove_feedback(
+        self, message_id: str, arxiv_id: str, kind: str, tg_user_id: int
+    ) -> int: ...
+
 
 @runtime_checkable
 class FeedbackSource(Protocol):
-    """Replies to the bot's own messages. Text only — reactions cannot fire in a DM (§8.3)."""
+    """Replies *and* reactions to the bot's own messages (§8.3).
+
+    Reactions require an administrator bot in a group, so they are subscribed to but must not be
+    assumed present.
+    """
 
     async def poll(self) -> list[tuple[MessageId, str, datetime]]: ...
 

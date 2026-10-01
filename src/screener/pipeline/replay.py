@@ -15,8 +15,8 @@ from datetime import datetime
 from pathlib import Path
 
 from screener.config import Settings
-from screener.domain.models import Ranking, Review, Scores, Selection
-from screener.domain.scoring import observable_dimensions, select
+from screener.domain.models import QualityScores, Ranking, Review, Selection
+from screener.domain.scoring import select
 from screener.domain.types import RUBRIC_WEIGHTS, RunId
 
 
@@ -52,14 +52,25 @@ def _stored_rankings(conn: sqlite3.Connection, where: str, params: list[object])
     """
     from screener.domain.models import Assessment
 
+    # Newest run first, then by score: the dedupe below keeps the *latest* verdict per paper,
+    # so a paper reviewed twice shows what the most recent run decided about it.
     rows = conn.execute(
-        f"SELECT * FROM rankings WHERE {where} ORDER BY score DESC",
+        f"SELECT r.* FROM rankings r JOIN runs u ON u.run_id = r.run_id"
+        f" WHERE {where.replace('run_id', 'r.run_id')}"
+        f" ORDER BY u.started_at DESC, r.score DESC",
         params,
     ).fetchall()
     out: list[Ranking] = []
+    seen: set[tuple[str, int]] = set()
     for row in rows:
         arxiv_id = str(row["arxiv_id"])
         version = int(row["version"])
+        if (arxiv_id, version) in seen:
+            # A re-armed and re-run day holds a ranking for this paper under two runs. The
+            # caller passes run ids newest-first, so the first one wins and replay shows one
+            # row per paper instead of the same pick twice.
+            continue
+        seen.add((arxiv_id, version))
         arow = conn.execute(
             "SELECT * FROM assessments WHERE arxiv_id=? AND version=? AND stage='review'"
             " ORDER BY created_at DESC LIMIT 1",
@@ -104,7 +115,9 @@ def replay_run(cfg: Settings, date: str) -> ReplayResult:
     try:
         try:
             runs = conn.execute(
-                "SELECT run_id FROM runs WHERE date(started_at)=? ORDER BY started_at", (date,)
+                # Newest first, so the dedupe above keeps the latest verdict.
+                "SELECT run_id FROM runs WHERE date(started_at)=? ORDER BY started_at DESC",
+                (date,),
             ).fetchall()
         except sqlite3.OperationalError:
             # A DB that has never been migrated is "nothing stored", not a crash: the CLI turns
@@ -152,8 +165,8 @@ def backtest_weights(cfg: Settings, since: str, overrides: dict[str, float] | No
             if arow is None or not arow["payload"]:
                 after.append((arxiv_id, current))
                 continue
-            scores = Scores.model_validate(json.loads(str(arow["payload"])))
-            observable = observable_dimensions(scores)
+            scores = QualityScores.model_validate(json.loads(str(arow["payload"])))
+            observable = scores.observable()
             base = {dim: weights[str(dim)] for dim in observable}
             total = sum(base.values()) or 1.0
             rescored = sum(observable[d] * (base[d] / total) for d in observable)

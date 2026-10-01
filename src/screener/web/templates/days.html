@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Digests by day</h1>
+{% if days %}
+<table>
+  <tr><th>day</th><th class="r">papers</th><th class="r">messages</th><th class="r">best</th><th class="r">mean</th><th class="r">cost</th><th class="r">reactions</th></tr>
+  {% for d in days %}
+  <tr>
+    <td><a href="/day/{{ d.day }}">{{ d.day }}</a></td>
+    <td class="r">{{ d.papers }}</td><td class="r">{{ d.messages }}</td>
+    <td class="r">{{ d.best_score }}</td><td class="r">{{ d.mean_score }}</td>
+    <td class="r">${{ "%.4f"|format(d.cost_usd) }}</td><td class="r">{{ d.reactions }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="empty">No digests delivered yet.</p>{% endif %}
+{% endblock %}

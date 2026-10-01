@@ -15,29 +15,26 @@ from datetime import UTC, datetime
 
 import pytest
 
-from screener.domain.models import Assessment, Ranking, Review, Scores, Selection
+from screener.domain.models import Assessment, QualityScores, Ranking, Review, Selection
 from screener.domain.relevance import normalise_topics
 from screener.domain.scoring import (
     composite,
     effective_weights,
-    observable_dimensions,
     score_band,
     select,
+    split_halves,
 )
 from screener.domain.types import RUBRIC_WEIGHTS, TRIAGE_WEIGHTS, HardFlag, SoftFlag
 from tests.factories import review_body
 
 
-def _scores(*, pedigree: float | None = None, early: float | None = None) -> Scores:
-    return Scores(
+def _scores(*, pedigree: float | None = None, early: float | None = None) -> QualityScores:
+    return QualityScores(
         relevance=7.0,
         novelty=7.0,
         rigor=6.0,
         evidence_strength=6.0,
-        impact_forecast=7.0,
         reproducibility=5.0,
-        pedigree=pedigree,
-        early_signal=early,
     )
 
 
@@ -104,65 +101,89 @@ def test_rubric_weights_sum_to_one() -> None:
 def test_triage_weights_sum_to_one() -> None:
     """Triage weights are §6.1 renormalised over four dims; they must still total 1.0.
 
-    An earlier draft of the design wrote .27/.27/.27/.20 here, which sums to 1.01. This test
-    is the thing that would have caught it.
+    An earlier draft wrote .27/.27/.27/.20 here, which sums to 1.01. This test is the thing that
+    would have caught it.
     """
     assert sum(TRIAGE_WEIGHTS.values()) == pytest.approx(1.0)
 
 
-def test_v1_effective_weights_span_six_and_sum_to_one() -> None:
-    observable = observable_dimensions(_scores())
-    assert set(observable) == {
-        "relevance",
-        "novelty",
-        "rigor",
-        "evidence_strength",
-        "impact_forecast",
-        "reproducibility",
-    }
-    weights = effective_weights(observable)
+def test_the_rubric_has_two_separate_halves() -> None:
+    """Quality is judged from text; impact is measured. The split is the design (§6.1)."""
+    from screener.domain.types import MEASURED_DIMENSIONS, QUALITY_DIMENSIONS
+
+    judged = sum(RUBRIC_WEIGHTS[d] for d in QUALITY_DIMENSIONS)
+    measured = sum(RUBRIC_WEIGHTS[d] for d in MEASURED_DIMENSIONS)
+    assert judged == pytest.approx(0.55)
+    assert measured == pytest.approx(0.45)
+    assert len(QUALITY_DIMENSIONS) + len(MEASURED_DIMENSIONS) == 8
+
+
+def test_no_dimension_is_a_forecast() -> None:
+    """`impact_forecast` is gone: at T+14 impact is read, not predicted (§5.2)."""
+    assert "impact_forecast" not in RUBRIC_WEIGHTS
+    assert "impact_forecast" not in QualityScores.model_fields
+
+
+def test_weights_renormalise_over_the_observed_dimensions() -> None:
+    weights = effective_weights({"relevance": 7.0, "novelty": 7.0})
     assert sum(weights.values()) == pytest.approx(1.0)
-    assert weights["relevance"] == pytest.approx(0.20 / 0.90, abs=1e-6)
+    assert weights["novelty"] == pytest.approx(0.16 / 0.28)
 
 
-def test_v15_effective_weights_span_eight_and_sum_to_one() -> None:
-    observable = observable_dimensions(_scores(pedigree=5.0, early=6.0))
-    assert len(observable) == 8
-    assert sum(effective_weights(observable).values()) == pytest.approx(1.0)
+def test_an_absent_measured_signal_is_renormalised_not_scored_zero() -> None:
+    """Measurement showed citations and venue are *normally* absent at T+14 (§6.1.0).
+
+    A paper must not be punished for a signal that does not exist, so the judged half simply
+    carries more weight.
+    """
+    quality = {"relevance": 8.0, "novelty": 8.0}
+    judged_only, _, w_only = composite(quality, None)
+    with_repo, _, w_both = composite(quality, {"repo_signal": 8.0})
+    assert w_only["relevance"] == pytest.approx(RUBRIC_WEIGHTS["relevance"] / 0.28)
+    assert w_both["relevance"] < w_only["relevance"], "the measured half should take share"
+    assert judged_only == with_repo == pytest.approx(8.0), "at equal scores the halves agree"
 
 
-def test_missing_dimension_is_renormalised_not_zeroed() -> None:
-    """A paper with no enrichment must not be silently penalised for it (§6.5)."""
-    without = observable_dimensions(_scores())
-    with_all = observable_dimensions(_scores(pedigree=10.0, early=10.0))
-    score_without, _, _ = composite(without)
-    score_with, _, _ = composite(with_all)
-    assert score_with > score_without, "adding high scores for pedigree/early_signal should help"
-    assert score_without > 0.0, "absence must not collapse the score to zero"
+def test_a_strong_measured_signal_raises_the_composite() -> None:
+    quality = {"relevance": 5.0, "novelty": 5.0}
+    low, _, _ = composite(quality, {"repo_signal": 0.0})
+    high, _, _ = composite(quality, {"repo_signal": 10.0})
+    assert high > low
 
 
 def test_no_observable_dimensions_is_an_error_not_a_zero() -> None:
     with pytest.raises(ValueError):
-        effective_weights({})
+        composite({}, None)
+
+
+def test_split_halves_reports_each_side_separately() -> None:
+    """The digest prints `7.8q + 6.2m`, never one blended number (§7.3)."""
+    q_mean, m_mean, q_share, m_share = split_halves(
+        {"relevance": 8.0, "novelty": 8.0}, {"repo_signal": 6.0}
+    )
+    assert q_mean == pytest.approx(8.0)
+    assert m_mean == pytest.approx(6.0)
+    assert q_share + m_share == pytest.approx(1.0)
+    assert q_share > m_share
 
 
 # --- penalties and gates ------------------------------------------------------------------
 
 
 def test_soft_flags_penalise_by_half_a_point_each() -> None:
-    observable = observable_dimensions(_scores())
-    base, _, _ = composite(observable, soft_flag_count=0)
-    one, _, _ = composite(observable, soft_flag_count=1)
-    two, _, _ = composite(observable, soft_flag_count=2)
+    quality = _scores().observable()
+    base, _, _ = composite(quality, None, soft_flag_count=0)
+    one, _, _ = composite(quality, None, soft_flag_count=1)
+    two, _, _ = composite(quality, None, soft_flag_count=2)
     assert base - one == pytest.approx(0.5)
     assert one - two == pytest.approx(0.5)
 
 
 def test_hard_flag_disqualifies_without_double_penalising() -> None:
     """Hard flags set disposition='gated'; the composite must not also subtract for them."""
-    observable = observable_dimensions(_scores())
-    clean, _, _ = composite(observable, soft_flag_count=0)
-    soft_only, _, _ = composite(observable, soft_flag_count=0)
+    quality = _scores().observable()
+    clean, _, _ = composite(quality, None, soft_flag_count=0)
+    soft_only, _, _ = composite(quality, None, soft_flag_count=0)
     assert clean == pytest.approx(soft_only)
 
 

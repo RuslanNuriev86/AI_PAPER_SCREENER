@@ -1,6 +1,17 @@
 # Selection policy (§6.4). The single home for every cap and threshold.
 max_papers: 6        # 3-6 quality-gated picks; 0 is an acceptable outcome
-min_score: 6.5
+# Re-derived after the rubric moved to the T+14 rating point (DESIGN.md §5.2, §6.1). The
+# measured half is *absent* for every paper in the sampled T+14 cohort (citations read 0 for
+# all of them, no venue, no findable repo), so §6.5 renormalisation puts the whole weight on the
+# judged half — and the judged half no longer contains `impact_forecast`, the dimension the model
+# previously scored most generously. The distribution therefore moved down:
+#
+#   16 papers: min 1.49 / median 3.85 / max 5.35
+#   4.0 -> 8 picks   4.5 -> 7   5.0 -> 4   5.5 -> 0
+#
+# 5.0 sits mid-band for the §1.2 target of 3-6. This is a *sample*, not a calibration: the
+# threshold must be re-derived from the maturity labels once the T+90 rung exists (§6.6.7).
+min_score: 5.0
 per_topic_cap: 2
 per_lab_cap: 3
 max_tag_jaccard: 0.60

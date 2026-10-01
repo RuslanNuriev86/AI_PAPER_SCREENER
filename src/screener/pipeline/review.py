@@ -21,12 +21,13 @@ from screener.domain.models import (
     Paper,
     Prompt,
     Ranking,
+    RatingBasis,
     RelevanceHint,
     Review,
     RunStats,
 )
 from screener.domain.relevance import normalise_topics
-from screener.domain.scoring import composite, observable_dimensions
+from screener.domain.scoring import composite, split_halves
 from screener.domain.types import RunId
 from screener.ledger import Ledger, estimate
 from screener.ports import LLM
@@ -107,13 +108,31 @@ async def review_one(
         soft_flags=list(review.soft_flags),
         hard_flag=review.hard_flag,
     )
-    return _to_ranking(paper, review, assessment), entry, None
+    return _to_ranking(paper, review, assessment, now=now), entry, None
 
 
-def _to_ranking(paper: Paper, review: Review, assessment: Assessment) -> Ranking:
-    """§6.5: hard flags disqualify, soft flags penalise, missing dimensions renormalise."""
-    observable = observable_dimensions(review.scores)
-    score, components, weights = composite(observable, soft_flag_count=len(review.soft_flags))
+def _to_ranking(paper: Paper, review: Review, assessment: Assessment, *, now: datetime) -> Ranking:
+    """Build the ranking from the judged half.
+
+    The measured half is attached afterwards by the pipeline, once enrichment has run. That
+    ordering is deliberate: the LLM must not be able to influence, or invent, a citation count,
+    so it never sees the signals and its scores carry only the quality dimensions (§6.1).
+    """
+    quality = review.scores.observable()
+    score, components, weights = composite(quality, None, soft_flag_count=len(review.soft_flags))
+    q_mean, _m_mean, q_share, m_share = split_halves(quality, None)
+    basis = RatingBasis(
+        age_days=max(0, (now - paper.submitted_at).days),
+        quality=review.scores,
+        quality_score=q_mean,
+        measured_score=None,
+        quality_weight=q_share,
+        measured_weight=m_share,
+        components=components,
+        effective_weights=weights,
+        soft_flags=list(review.soft_flags),
+        soft_flag_penalty=0.5 * len(review.soft_flags),
+    )
     return Ranking(
         arxiv_id=paper.arxiv_id,
         version=paper.version,
@@ -126,8 +145,9 @@ def _to_ranking(paper: Paper, review: Review, assessment: Assessment) -> Ranking
         disposition="gated" if review.hard_flag is not None else "eligible",
         hard_flag=review.hard_flag,
         topics=normalise_topics(review.tags),
-        lab=None,  # needs enrichment (v1.5), so per_lab_cap does not apply at v0
+        lab=None,  # needs affiliation enrichment, so per_lab_cap does not apply
         tags=list(review.tags),
+        basis=basis,
     )
 
 

@@ -29,7 +29,6 @@ VALID_REVIEW = {
         "novelty": 7,
         "rigor": 6,
         "evidence_strength": 6,
-        "impact_forecast": 7,
         "reproducibility": 5,
     },
     "soft_flags": [],
@@ -135,7 +134,7 @@ async def test_parses_a_well_formed_response_into_the_schema() -> None:
     review = await _call(llm)
     assert isinstance(review, Review)
     assert review.lenses == ["method"]
-    assert review.scores.impact_forecast == 7
+    assert review.scores.novelty == 7
 
 
 async def test_malformed_json_is_retried_once_then_succeeds() -> None:

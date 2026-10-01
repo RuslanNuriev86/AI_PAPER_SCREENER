@@ -51,7 +51,13 @@ class TelegramNotifier:
         return f"{API}/bot{self.token}/{method}"
 
     async def send(self, chunks: Sequence[str]) -> list[MessageId]:
-        """Send each chunk as its own message. Returns one id per chunk, in order."""
+        """Send each chunk as its own message. Returns one id per chunk, in order.
+
+        Every chunk after the first is sent with notifications suppressed. Since §8.4 puts one
+        paper in each message, a five-paper digest is five messages; without this the reader's
+        phone would buzz five times for one digest. Suppression is per-message, so the digest
+        still announces itself once.
+        """
         ids: list[MessageId] = []
         for i, chunk in enumerate(chunks):
             if len(chunk) > CHUNK_LIMIT:
@@ -63,6 +69,7 @@ class TelegramNotifier:
                 "text": chunk,
                 "parse_mode": "HTML",
                 "link_preview_options": {"is_disabled": True},
+                "disable_notification": bool(i),
             }
             resp = await self._post(
                 "sendMessage", payload, context=f"chunk {i + 1}/{len(chunks)} ({len(chunk)} chars)"
@@ -143,7 +150,9 @@ class TelegramNotifier:
         reactions cannot be a live mechanism in a private chat.
         """
         payload: dict[str, Any] = {
-            "allowed_updates": ["message"],  # NOT message_reaction — see module docstring
+            # Reaction updates only arrive for an administrator bot, but subscribing costs
+            # nothing and means no code change is needed once it is promoted.
+            "allowed_updates": ["message", "message_reaction"],
             "timeout": 0,
         }
         if offset is not None:

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 
 from screener.config import CONFIG_DIR, Settings, load_settings
@@ -43,6 +45,7 @@ async def _run(cfg: Settings) -> int:
             notifier=deps.notifier,
             heartbeat=deps.heartbeat,
             ledger=deps.ledger,
+            enricher=deps.enricher,
         )
     typer.echo(f"status={run.status} spent=${run.stats.cost_usd:.4f}")
     picks = run.digest.items if run.digest else []
@@ -198,6 +201,158 @@ async def _feedback(cfg: Settings) -> int:
 
 
 @app.command()
+def web(
+    host: Annotated[str, typer.Option(help="interface to bind")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="port to bind")] = 8765,
+    config_dir: Annotated[str, typer.Option(help="config directory")] = str(CONFIG_DIR),
+    allow_remote: Annotated[
+        bool, typer.Option("--allow-remote", help="permit binding a non-loopback interface")
+    ] = False,
+) -> None:
+    """Browse what was found, delivered and rated (§17).
+
+    Read-only and localhost-only by default. There is no authentication, so binding anything but
+    a loopback address publishes the entire paper history to the network; that requires saying so
+    explicitly with --allow-remote.
+    """
+    import uvicorn
+
+    from screener.web.app import create_app
+
+    cfg = _settings(config_dir)
+    loopback = host in {"127.0.0.1", "::1", "localhost"}
+    if not loopback and not allow_remote:
+        typer.secho(
+            f"refusing to bind {host}: this server has no authentication.\n"
+            "Re-run with --allow-remote if the network really is trusted, or reach it over an\n"
+            "SSH tunnel:  ssh -L "
+            f"{port}:127.0.0.1:{port} <host>",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
+    typer.secho(
+        f"serving http://{host}:{port}  (read-only, {cfg.screener_db})", fg=typer.colors.GREEN
+    )
+    uvicorn.run(create_app(cfg.screener_db), host=host, port=port, log_level="warning")
+
+
+@app.command()
+def explain(
+    arxiv_id: Annotated[str, typer.Argument(help="the paper, e.g. 2609.35909")],
+    config_dir: Annotated[str, typer.Option(help="config directory")] = str(CONFIG_DIR),
+) -> None:
+    """Print exactly why a paper scored what it scored (§7.3).
+
+    Reads stored data, so it works long after the digest went out, and shows both halves
+    separately — the judged half is an opinion about text, the measured half is a reading from
+    an external source at a known age. They are never blended into one unexplained number.
+    """
+    import json as _json
+    import sqlite3
+
+    cfg = _settings(config_dir)
+    conn = sqlite3.connect(cfg.screener_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT r.*, u.started_at FROM rankings r JOIN runs u USING(run_id)"
+            " WHERE r.arxiv_id=? ORDER BY u.started_at DESC LIMIT 1",
+            (arxiv_id,),
+        ).fetchone()
+        if row is None:
+            typer.secho(f"no stored rating for {arxiv_id}", fg=typer.colors.YELLOW)
+            raise typer.Exit(1)
+        arow = conn.execute(
+            "SELECT payload, model, prompt_version FROM assessments"
+            " WHERE arxiv_id=? AND stage='review' ORDER BY created_at DESC LIMIT 1",
+            (arxiv_id,),
+        ).fetchone()
+        mrow = conn.execute(
+            "SELECT citations, stars, venue, code_url, components_present, status, rung_days,"
+            " actual_age_days, matured_impact FROM outcomes WHERE arxiv_id=?"
+            " ORDER BY rung_days",
+            (arxiv_id,),
+        ).fetchall()
+        # What the adapters read at the rating point. Distinct from the outcome rungs below,
+        # which are later re-measurements: this is the evidence the rating was actually built on.
+        srow = conn.execute(
+            "SELECT payload, fetched_at FROM enrichment WHERE arxiv_id=?"
+            " ORDER BY fetched_at DESC LIMIT 1",
+            (arxiv_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    typer.secho(f"{arxiv_id}  composite {row['score']:.2f}  ({row['disposition']})", bold=True)
+    typer.echo(
+        f"rated {str(row['started_at'])[:10]} by {arow['model'] if arow else '?'}"
+        f" prompt {arow['prompt_version'] if arow else '?'}"
+    )
+    typer.echo()
+    typer.echo("judged half (from the text):")
+    if arow is not None and arow["payload"]:
+        payload = _json.loads(str(arow["payload"]))
+        components = _json.loads(str(row["components"]))
+        weights = _json.loads(str(row["effective_weights"]))
+        for dim, raw in payload.items():
+            w = weights.get(dim)
+            if w is None:
+                continue
+            typer.echo(f"  {dim:<18} {raw:>4.1f} x {w:.3f} = {raw * w:>5.2f}")
+        contrib = sum(components.get(d, 0.0) for d in payload)
+        typer.echo(f"  {'':<18} {'':>4}   {'':>5}   {contrib:>5.2f}")
+        # Without this the printed arithmetic does not add up to the composite, which is worse
+        # than printing nothing: the reader cannot tell a penalty from a bug.
+        flags = _json.loads(str(row["soft_flags"] or "[]"))
+        if flags:
+            penalty = 0.5 * len(flags)
+            typer.echo(
+                f"  {'soft flags':<18} {'':>4}   {'':>5}   {-penalty:>5.2f}   ({', '.join(flags)})"
+            )
+            contrib -= penalty
+        typer.secho(f"  {'composite':<18} {'':>4}   {'':>5}   {contrib:>5.2f}", bold=True)
+    typer.echo()
+    typer.echo("measured half (read from external sources at rating time):")
+    if srow is not None and srow["payload"]:
+        signals = _json.loads(str(srow["payload"]))
+
+        def show(label: str, value: object) -> None:
+            typer.echo(f"  {label:<18} " + ("not measured" if value is None else str(value)))
+
+        show("age (days)", signals.get("age_days"))
+        show("stars", signals.get("stars"))
+        show("citations", signals.get("citations"))
+        show("venue", signals.get("venue"))
+        show("repo", signals.get("repo_url"))
+        typer.echo("  sources: " + (", ".join(signals.get("sources_ok") or []) or "none"))
+    else:
+        typer.echo("  nothing stored for this paper")
+
+    typer.echo()
+    typer.echo("later re-measurements (outcome rungs):")
+    if mrow:
+        for m in mrow:
+            bits = [
+                f"{m['stars']}★" if m["stars"] is not None else "no repo",
+                f"{m['citations']} citations" if m["citations"] is not None else "unread",
+                m["venue"] or "no venue",
+            ]
+            typer.echo(
+                f"  T+{m['rung_days']:<4} ({m['status']}, measured at "
+                f"T+{m['actual_age_days']}): " + " · ".join(bits)
+            )
+    else:
+        typer.echo("  no outcome rungs measured yet")
+    typer.echo()
+    typer.secho(
+        "note: the measured half is never fed back into the day-0 score (§6.6.6), so it "
+        "is reported, not blended.",
+        fg=typer.colors.BRIGHT_BLACK,
+    )
+    raise typer.Exit(0)
+
+
+@app.command()
 def rearm(
     date: Annotated[str, typer.Option("--date", help="YYYY-MM-DD")],
     config_dir: Annotated[str, typer.Option(help="config directory")] = str(CONFIG_DIR),
@@ -280,12 +435,33 @@ def stats(
 
 
 def main() -> None:
+    """Entry point.
+
+    Operational failures (a dead source, a rejected credential) get one readable line, not a
+    two-hundred-line rich traceback — the traceback is what the first real outage produced, and
+    it buried the only useful fact. Set `SCREENER_DEBUG=1` to get the full trace anyway.
+    """
     configure_logging()
+    debug = os.environ.get("SCREENER_DEBUG", "").strip() not in {"", "0", "false"}
     try:
         app()
     except ConfigError as exc:
         typer.secho(f"config error: {exc}", fg=typer.colors.RED)
         raise typer.Exit(2) from exc
+    except httpx.HTTPError as exc:
+        if debug:
+            raise
+        typer.secho(
+            f"network error: {type(exc).__name__}: {exc or 'no detail'}\n"
+            "the digest was not sent; re-running is safe (the seen-set prevents duplicates)",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1) from exc
+    except Exception as exc:
+        if debug:
+            raise
+        typer.secho(f"error: {type(exc).__name__}: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
 
 
 if __name__ == "__main__":

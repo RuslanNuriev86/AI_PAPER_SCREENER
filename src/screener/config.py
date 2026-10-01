@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     #: Where an undeliverable digest is parked. Configurable so tests cannot touch
     #: (or consume) a real outbox in the working directory.
     screener_outbox: str = "./outbox"
+    #: Raw arXiv responses, cached per category per day. The ToU asks for this explicitly
+    #: ("no need to call more than once a day"), and it is what stops a day of re-runs from
+    #: turning into a rate-limit ban.
+    screener_cache: str = "./cache"
     screener_mode: str = "live"  # live | dry
     screener_llm_fast: str = "deepseek-flash"
     screener_llm_deep: str = "deepseek-flash"

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>User reactions</h1>
+{% if not overview.reactions %}
+<p class="notice">
+  <b>No reactions captured yet.</b> Telegram only delivers <code>message_reaction</code> updates to a bot that is an
+  <b>administrator</b> of the chat. The subscription is already enabled, so reactions will appear here as soon as
+  <code>PaperScreener26_bot</code> is promoted in <i>ai_papers</i> and <code>screener feedback</code> next runs.
+  Written replies that quote a digest message are captured regardless.
+</p>
+{% endif %}
+{% include "period.html" %}
+
+<section class="two">
+  <div>
+    <h2>Most rated by readers</h2>
+    {% if top %}
+    <table>
+      <tr><th>paper</th><th class="r">score</th><th class="r">users</th></tr>
+      {% for t in top %}
+      <tr><td><a href="/paper/{{ t.arxiv_id }}">{{ t.title[:70] }}</a></td>
+          <td class="r"><b>{{ '%+d'|format(t.user_score or 0) }}</b></td>
+          <td class="r">{{ t.users }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}<p class="empty">Nothing yet.</p>{% endif %}
+  </div>
+  <div>
+    <h2>By emoji</h2>
+    <table>
+      {% for value, n in overview.emoji_totals.items() %}
+      <tr><td class="emoji">{{ value }}</td><td class="r">{{ n }}</td></tr>
+      {% endfor %}
+    </table>
+    <h2>By user</h2>
+    <table>
+      <tr><th>user</th><th class="r">score</th><th class="r">reactions</th><th class="r">replies</th></tr>
+      {% for name, r in overview.ratings_by_user.items() %}
+      <tr><td>{{ name }}</td><td class="r">{{ r.score }}</td><td class="r">{{ r.reactions }}</td><td class="r">{{ r.replies }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</section>
+
+<h2>Every reaction and reply</h2>
+{% if rows %}
+<table class="wide">
+  <tr><th>when</th><th>user</th><th>kind</th><th>value</th><th>paper</th><th>digest</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.created_at[:16].replace('T', ' ') }}</td>
+    <td>{{ r.tg_user_name or ('user ' ~ r.tg_user_id) }}</td>
+    <td><span class="pill">{{ r.kind }}</span></td>
+    <td class="emoji">{{ r.value }}</td>
+    <td><a href="/paper/{{ r.arxiv_id }}">{{ r.title[:70] }}</a></td>
+    <td>{% if r.delivered_on %}<a href="/day/{{ r.delivered_on }}">{{ r.delivered_on }}</a>{% else %}—{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="empty">No feedback rows in this period.</p>{% endif %}
+{% endblock %}

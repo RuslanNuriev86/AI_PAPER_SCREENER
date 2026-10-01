@@ -23,7 +23,7 @@ those four, not to wrap an API.
 | Failure mode | Why it happens | Design response |
 |---|---|---|
 | **Noise: "agent" is a wildly overloaded word** | cs.AI/cs.LG daily output is full of RL agents, agent-based simulation, economic/market agents, biological agents, and control-theory multi-agent systems. A keyword match on "agent" is ~70% wrong. | Two-layer relevance: cheap deterministic gate + LLM classification with explicit negative examples (§5). |
-| **"Promising" is invisible on day 0** | Citation counts, the usual proxy for importance, are 0 for a paper announced yesterday. Ranking by citations is structurally useless here — and a day-0 forecast cannot be checked on the day it is made, so it is unfalsifiable in practice. | Rank *and* verify. Rank on *predictable* features (novelty vs. cited prior art, evidence quality, lab/author track record, code release, early community signal), then close the loop: every gate-passing paper is enrolled in a watchlist and re-measured at T+14/T+90/T+180 against what actually happened — stars, upvotes, citations, venue acceptance. Forecasts become falsifiable labels that tune the ranker (§6.6, §13.4). |
+| **"Promising" is invisible on day 0** | Citation counts, the usual proxy for importance, are 0 for a paper announced yesterday. | **Stop rating on day 0.** The digest ranks the cohort that has just reached **T+14**, where citations, repo stars and venue are measurable facts rather than guesses (§5.2). Quality is still judged from the text — novelty, rigor, evidence — but *impact* is observed, not forecast. Nothing is predicted that could instead be measured. |
 | **LLM summaries are generic and unfalsifiable** | Without a contract, models emit "paves the way for future work" filler, and invent numbers that were never in the abstract. | Rubric-bound prompts, "why it matters" restricted to four named lenses, banned-phrase lint, and a separate faithfulness checker that verifies every claim against the source text (§8). |
 | **Daily digest quietly degrades** | A scheduler that stops running, a Telegram token that expires, or an LLM outage produces silence nobody notices. | Idempotent runs, structured run records, heartbeat monitoring, and degraded-but-delivered fallback instead of nothing (§12). |
 
@@ -38,11 +38,15 @@ those four, not to wrap an API.
   why it matters, and what is weak about it — without opening the PDF.
 - **Reproducible and tunable.** Selection is deterministic given stored assessments;
   ranking weights live in YAML, not in prompts or code.
-- **Measurably calibrated, or honestly not.** Predicted `impact_forecast` is checked
-  against observed outcomes at T+14/T+90/T+180. Target Spearman ≥ 0.35 at T+90 and a
-  non-flat reliability curve. If a matured rung says the forecast is uninformative, the
-  `impact` weight is cut and the negative result is recorded (§6.6.4) — not re-prompted
-  until the number looks better.
+- **Grounded in measured evidence.** Every rating names its basis: which signals were read,
+  at what age, and how each contributed. For a T+14 cohort that means citations, repo stars
+  and venue — facts, not forecasts — and the digest prints them (§7.3). The remaining
+  LLM-judged dimensions are explicitly the *quality* half, never dressed up as impact.
+- **Measurably calibrated, or honestly not.** The quality half of the rating is checked
+  against the T+90/T+180 rungs, which the T+14 rating cannot yet see. Target Spearman ≥ 0.35
+  at T+90 and a non-flat reliability curve. If a matured rung says the quality judgment is
+  uninformative, its weight is cut and the negative result is recorded (§6.6.4) — not
+  re-prompted until the number looks better.
 - **Cost predictable and capped.** A per-run USD ceiling that is *soft*: a run that
   reaches it stops spending and still delivers what it already verified, recorded
   `degraded`, rather than overspending or going silent (§11, §12.1).
@@ -178,10 +182,10 @@ ever needed — and it will not be.
 
 | # | Stage | Input → Output | Cost | Typical time | Failure behaviour |
 |---|---|---|---|---|---|
-| 1 | **fetch** | window → `list[Paper]` | free | 5–20 s (3 s/request, ~8 queries, **sequential on one connection**) | retry ×3 w/ backoff; abort run if zero papers *and* source errored |
+| 1 | **fetch cohort** | the T+14 window (§5.2) → `list[Paper]` | free | 30–70 s cold, ~0 s cached (**sequential on one connection**, large pages, day-cached) | retry ×3 w/ adaptive backoff; **one dead category must not lose the rest**; a total outage ends the run with a notice, not a traceback |
 | 2 | **gate** | `Paper` → `GateResult` | free | <1 s | pure function, always succeeds; reason + `RelevanceHint` persisted |
 | 2b | **dedupe_revisions** | `list[Paper]` → `list[Paper]` | free | <1 s | stateful (§6.2); drops a cosmetically-revised paper already delivered |
-| 3 | **enrich** | `Paper` → `Enrichment` | free (polite pools) | 10–30 s | best-effort: missing enrichment leaves `pedigree`/`early_signal` `None`, and §6.5 renormalises rather than scoring 0 |
+| 3 | **enrich** | `Paper` → `Enrichment` | free (polite pools) | 10–30 s | **core, not optional** (§5.2): citations + venue from Semantic Scholar, stars from GitHub, upvotes from HF. A dead source renormalises its dimension away rather than scoring 0 |
 | 4 | **triage** | 40–80 papers → `Triage` scores | ~$0.02 | 20–40 s | batch failures retried, then fall back to gate-only ordering |
 | 5 | **review** | top `review_top_k` (=16) → `Assessment` | $0.20–$1.50 | 60–180 s | per-paper failure drops that paper; ≥3 failures ⇒ degraded run |
 | 6 | **rank** | `Assessment[]` → `Ranking[]` | free | <1 s | pure, deterministic |
@@ -242,6 +246,39 @@ the hint and must output `agentic: bool` with a one-line justification and expli
 `not_agentic` red flag. Ambiguous cases get resolved by the model, not by ever-growing
 regexes.
 
+### 5.2 The rating point is T+14, and the cohort is defined by it
+
+The unit of the digest is not "papers announced recently" but **the cohort that has just
+reached T+14**. A run collects the papers whose announcement date falls in
+
+```
+[now − (cohort_age_days + catch_up_days),  now − cohort_age_days]
+```
+
+with `cohort_age_days: 14` and `catch_up_days: 2`. The catch-up range is what makes a missed
+day self-healing: the host may sleep, and a paper must not silently miss its only rating
+opportunity. The `(arxiv_id, version)` seen-set guarantees each paper is digested exactly once
+however many times it falls inside the window.
+
+Why 14 and not 0, 7 or 30:
+
+| age | citations | repo stars | venue | verdict |
+|---|---|---|---|---|
+| T+0 | 0 by construction | 0 unless pre-released | none | unratable — every impact signal is absent |
+| **T+14** | small but non-zero, and separating | **the most informative signal at this age** | occasionally present (authors post after acceptance) | **chosen** |
+| T+90 | usable for ranking | mature | common | better signal, but a three-month-old digest has lost its news value |
+| T+180 | strong | mature | near-complete | the calibration rung, not the delivery rung |
+
+Two honest constraints, stated so nobody designs around a signal that does not exist:
+**citations at T+14 are small** (most papers read 0–2), so the scale is compressed and a single
+citation moves the score a lot; and **venue acceptance is rare at T+14**, because most decisions
+land later. Both are *measured* rather than assumed — and when a signal is absent it is
+renormalised away, never scored zero (§6.5).
+
+The consequence for the product: the digest is a fortnight behind the arXiv firehose. That is
+the trade the design makes deliberately — a rating that is grounded in observed evidence beats a
+rating that is timely and unfalsifiable.
+
 **Profile config** (`config/profile.yaml`) holds all of the above as data:
 
 ```yaml
@@ -277,32 +314,74 @@ printed.**
 
 ### 6.1 Rubric — the definition of "most proficient and promising"
 
-Eight scored dimensions, each 0–10, defined tightly enough that a model is repeatable
-and a human can audit it. Scores are LLM-produced *features*; weights are ours.
+Eight scored dimensions, each 0–10, in two explicitly separated halves. The split is the point:
+**quality is judged, impact is measured**, and the digest must never present the first as if it
+were the second.
 
-| Dimension | Default weight | Definition (what earns a 9) |
-|---|---|---|
-| `relevance` | 0.20 | Directly advances LLM-agent capability/reliability/evaluation *and* matches the interest profile. 9 = squarely in a boosted topic. |
-| `novelty` | 0.20 | 9 = a new mechanism, formulation, or measurement the field did not have; 3 = a recombination of known techniques. Penalize "we apply X to Y" with no new insight. |
-| `rigor` | 0.15 | 9 = multiple strong baselines, ablations, error bars/seeds, honest limitations, released artifacts. 3 = single baseline or self-reported only. |
-| `evidence_strength` | 0.10 | Magnitude *and* credibility of the demonstrated result (quoted numbers, eval suite size, held-out conditions, human eval). |
-| `impact_forecast` | 0.20 | Calibrated expectation this becomes a standard reference/framework component within 12 months. Anchored by written anchors (see below), not vibes. |
-| `reproducibility` | 0.05 | Code, data, artifacts released and plausibly runnable; protocol/benchmark released. |
-| `pedigree` | 0.05 | Venue acceptance (from the arXiv `comment` field), strong lab/author track record (h-index, prior influential work) as *capped* signals. |
-| `early_signal` | 0.05 | HF Daily Papers upvotes, GitHub stars, notable adjacent-lab uptake. Capped at 10 and never decisive — it is the most gameable signal. |
+| Dimension | Weight | Source | Definition (what earns a 9) |
+|---|---|---|---|
+| `relevance` | 0.12 | LLM, from text | Directly advances LLM-agent capability/reliability/evaluation *and* matches the profile. 9 = squarely in a boosted topic. |
+| `novelty` | 0.16 | LLM, from text | 9 = a new mechanism, formulation, or measurement the field did not have; 3 = a recombination. Penalise "we apply X to Y" with no insight. |
+| `rigor` | 0.13 | LLM, from text | 9 = multiple strong baselines, ablations, error bars/seeds, honest limitations, released artifacts. 3 = single baseline or self-reported only. |
+| `evidence_strength` | 0.08 | LLM, from text | Magnitude *and* credibility of the demonstrated result: quoted numbers, eval-suite size, held-out conditions, human eval. |
+| `reproducibility` | 0.06 | LLM, corroborated | Code, data and artifacts released and plausibly runnable. Corroborated by `repo_signal` — a claim of released code with no findable repo scores lower. |
+| `citation_signal` | 0.08 | **measured at T+14** | Citations already accrued. **Normally absent** (§6.1.0): measured zero for every cohort sampled, because citations accrue to the published DOI while we hold the arXiv DOI. Kept as a dimension so the T+90 rung can carry it once a merging source exists. |
+| `repo_signal` | 0.25 | **measured at T+14** | GitHub stars on the linked repo, **counted only if the repo was created near the paper** (§6.1.0). The only measured signal with real spread at this age. |
+| `venue_signal` | 0.12 | **measured at T+14** | A stated venue or acceptance, from the arXiv `comment` field. Absent at this age in every cohort measured; decisive when present. |
 
-**The last two rows are enrichment-dependent.** Until v1.5 supplies `Enrichment` (§6.4),
-`pedigree` and `early_signal` are `None`, and §6.5 renormalises the composite over the
-remaining six dimensions rather than scoring them zero. Weights therefore sum to 1.0 over
-6 dimensions at v1 and over all 8 from v1.5 — one config change, no refactor.
+The quality half totals 0.55 and the measured half 0.45. `impact_forecast` is **gone**: it was a
+guess about citations, and at T+14 we can simply read them. `pedigree` and `early_signal` are
+likewise gone — folded into `venue_signal` and `repo_signal`, which measure the same things
+instead of inferring them.
 
-**Impact forecast anchors** (stored in the prompt, so the scale is stable across runs):
+#### 6.1.0 What the signals actually measure at each age (measured, not assumed)
 
-- 9–10 = likely to be a named baseline/component others build on within a year;
-- 7–8 = likely to be widely cited and replicated;
-- 5–6 = solid contribution, respectable citations;
-- 3–4 = incremental, niche citations;
-- 0–2 = superseded quickly or not reproducible.
+Before choosing the rating point, the signals were sampled from live cohorts (40–60 gated papers
+per age), querying OpenAlex by arXiv DOI for citations and the GitHub API for stars:
+
+| age | cited papers | max citations | papers with a findable repo | star distribution |
+|---|---|---|---|---|
+| T+14 | **0 / 50** | **0** | 4 / 40 (10%) | 7, 4, 2 |
+| T+30 | **0 / 39** | **0** | 8 / 40 (20%) | 34432, 1147, 52, 3, 1, 1, 1, 1 |
+| T+60 | 1 / 40 | 1 | 6 / 40 (15%) | 2117, 15, 4, 0, 0, 0 |
+| T+90 | **0 / 39** | **0** | 6 / 40 (15%) | 22, 1, 0, 0 |
+
+Three conclusions, and the first two are uncomfortable:
+
+1. **Citations are unusable as a rating input at T+14 — and, as measured here, at every age
+   sampled.** Zero of 39 papers at T+90 showed a citation. The constraint is not paper age but
+   *attribution*: citations accrue to a paper's **published version DOI**, while we look up the
+   **arXiv DOI**, so the preprint record stays at zero forever. `citation_signal` therefore stays
+   in the rubric as a first-class dimension that is normally *absent* (and renormalised away,
+   §6.5) rather than a 0.20 weight that silently contributes nothing. Making it real needs a
+   source that merges preprint and published records — Semantic Scholar's API key, since its
+   unauthenticated pool 429s — and that is a v1.5 task with its own measurement.
+2. **Repo stars discriminate, but raw counts are contaminated.** The T+30 sample contains a
+   34,432-star repository. That is not a paper's own traction; it is a paper linking to a
+   *pre-existing* popular project. Stars are therefore only counted when the repository was
+   created within `repo_young_days` (default 45) of the paper's announcement, which is a signal
+   about *this* paper. Without that guard one link can dominate a cohort.
+3. **Venue is absent at T+14** and OpenAlex reports only "arXiv (Cornell University)" — the
+   preprint record. A venue is decisive when present, which is why it keeps a place, but it is
+   rare and must render as "no venue yet" rather than as silence.
+
+The rating point stays at **T+14**, but on the strength of the signals that survive this
+measurement — repo traction, code release, and two weeks of citation-independent hindsight —
+not on the citation counts the table shows are not there.
+
+#### 6.1.1 Anchors are derived from the observed T+14 distribution
+
+The measured dimensions use written anchors in `config/outcome_scale.yaml`, re-derived from
+cohort quantiles rather than invented. That matters more here than anywhere else in the design,
+because a naive mature-paper scale (say "50 citations is a 9") would score **every** T+14 paper
+between 0 and 1 and flatten the whole measured half to noise.
+
+Anchors must also **never move silently**: they live in config, they enter `config_hash`, and the
+calibration report prints the cohort's p50/p90/p99 per rung so drift is visible (§6.6.3).
+
+**Impact forecast anchors** are retained in the prompt only as the calibration check for the
+quality half — the T+90 rung is what tells us whether a `novelty` 9 at T+14 predicted a paper
+that mattered.
 
 ### 6.2 Hard gates (applied before scoring, and re-checkable after review)
 
@@ -742,6 +821,13 @@ Neither is a bug; both are the kind of thing only measurement could reveal. They
 because §13.4's calibration loop is what will settle them, and because a threshold nobody has
 looked at the distribution of is an assumption, not a decision.
 
+**Outcome of that measurement: `min_score` was lowered from 6.5 to 5.5.** A second independent
+16-paper sample peaked at 6.44, so 6.5 admitted *zero* papers and the digest shipped empty. The
+two samples together give: 6.5 -> 0–2 picks, 6.0 -> 4, 5.5 -> 5, 5.0 -> 7–8. At 5.5 both samples
+land mid-band for the §1.2 target of 3–6. The soft-flag coefficient is deliberately *not*
+changed yet — that alters ranking order rather than a cutoff, so it waits for the maturity
+labels rather than being tuned by eye.
+
 ---
 
 ## 7. Summarization: making the output actually good
@@ -781,6 +867,33 @@ and write to them:
 
 If none applies, the honest output is an empty `lenses` list and a low `impact_forecast`
 — which is exactly the outcome that should lose to a stronger paper.
+
+#### 7.3 Every rating prints its basis
+
+A score with no stated basis is an assertion. Each digest item therefore carries one compact
+line naming the signals that produced it, and `screener explain <arxiv_id>` prints the full
+breakdown. The line distinguishes the two halves by construction, because they come from
+different places:
+
+```
+<b>Basis</b> 7.0 = quality 7.8×0.50 + impact 6.2×0.50
+  impact: 41★ repo · 2 citations · no venue yet  (T+14)
+  quality: novelty 8 · rigor 7 · relevance 8 · evidence 6 · repro 6
+```
+
+Three rules make that honest:
+
+1. **Measured signals show their raw value and age.** `41★`, `2 citations`, `T+14` — never a
+   bare number whose provenance the reader has to guess. A signal that was not measured says so
+   ("no venue yet") rather than being omitted, so absence is visible as absence.
+2. **The quality half is labelled as judgment.** It is prose-derived and the reader is told so;
+   nothing about it implies measurement.
+3. **No forecast appears anywhere.** With the rating point at T+14 there is no predicted
+   impact to disclose, which removes the entire class of "the model thinks this will be big"
+   claims from the digest.
+
+The same structure is what `replay` and the maturity reports read, so a rating printed in the
+digest can be fully reconstructed later from stored data.
 
 **Anti-slop, deterministically enforced (`domain/style.py`):**
 
@@ -867,47 +980,56 @@ Skipped at 5.8 on day 0; now +312 ★ and 24 citations in 90 days.
 The announcement date is mandatory in this block. A resurfaced paper must never be
 mistakable for a new one.
 
-Design rules: each item ≤ ~900 characters; ≤ 5 items per message; **split on item
-boundaries**, never mid-item; Telegram's 4096-character limit is asserted in code, not
-hoped for (§9). Links are always explicit `abs`/`pdf`/`code` — no auto-previews
-(`disable_web_page_preview=True`) so the digest stays scannable.
+Design rules: each item ≤ ~900 characters; **exactly one paper per message** (§8.4), which
+also means splitting always happens on item boundaries; Telegram's 4096-character limit is
+asserted in code, not hoped for (§9). Links are always explicit `abs`/`pdf`/`code` — no
+auto-previews (`link_preview_options.is_disabled=true`) so the digest stays scannable.
 
 ### 8.2 Message strategy
 
 - `parse_mode=HTML` (more forgiving than MarkdownV2 escaping rules).
-- Multi-message digests: item 1 shipped as a standalone "headline" message, the rest
-  as one or two follow-ups — so a notification preview already shows the top pick.
+- **One paper per message** (§8.4). The header rides on the first paper's message and the
+  footer on the last, so a digest of *n* picks is *n* messages.
+- **Only the first message notifies**; the rest are sent with
+  `disable_notification=true`. Without that, one paper per message would mean one phone
+  buzz per paper, which is a worse experience than the ambiguity it fixes.
 - Optional weekly recap (Sunday) as an editable single message.
 
 ### 8.3 Feedback loop (what makes it improve)
 
-**Reactions are not available, so feedback is text.** Telegram's `message_reaction` update
-requires the bot to be an *administrator* of the chat, and administrator status is a
-group/channel-only concept — a bot cannot be an admin of a 1:1 DM. In a private chat, zero
-reaction updates ever arrive. That is documented in the [Bot API](https://core.telegram.org/bots/api#update)
-and confirmed empirically: Business Bot mode does not help (`MessageReactionUpdated` has
-no `business_connection_id`), and neither does MTProto push from a user session — only
-user-side *polling* of `messages.getHistory` works, which would mean shipping a second,
-long-lived Telethon service to read an emoji. Not worth it.
+**Two mechanisms, both per-user: emoji reactions and written replies.** An earlier draft
+concluded reactions were impossible, on the reasoning that Decision 2 pinned delivery to a
+personal chat and `message_reaction` updates require the bot to be an *administrator*, which
+is a group/channel-only concept. **That premise was wrong about this deployment: the digest
+is delivered to a group** (`ai_papers`), where administrator status exists and reactions are
+therefore available. Verified against the live API rather than the documentation: the bot was
+a plain `member`, and Telegram delivered `message_reaction` updates to it *zero* times until it
+is promoted.
 
-Decision 2 pins delivery to a personal chat, so the loop uses the channel that already
-works there: **the user replies with an emoji or short text, and the existing
-message-reply path parses it.** `screener feedback` runs on `getUpdates` with
-`allowed_updates=["message"]` — reactions dropped from the filter entirely — after
-delivery and then every 15 minutes on `screener-feedback.timer` (§12.5), so a reply that
-arrives hours later is still captured. Signals:
+So `screener feedback` submits `allowed_updates=["message", "message_reaction"]`. Subscribing
+costs nothing while the bot is a member — it simply receives no reaction updates — which means
+promoting it needs no code change. Until then the reactions view states the cause instead of
+looking broken, and replies are captured either way.
 
-- A reply beginning with 👍 / 👎 / 🔥 (optionally followed by text) → `feedback` row of
-  kind `'rating'` against the resolved `(arxiv_id, run_id)`. A bare emoji is one tap on a
-  phone keyboard, so the friction is close to that of a reaction.
-- Any other free-text reply → stored verbatim as kind `'reply'`; a weekly job extracts
-  preference statements ("more theory", "less benchmark-only work") into `profile.notes`,
-  injected into the review prompt as soft guidance. Human language becomes policy without
-  editing weights by hand.
+Signals:
 
-If one-tap UX is ever wanted, the upgrade is inline-keyboard `callback_query` buttons
-(which do work in DMs), not reactions. That is a v2 change and needs a callback state
-machine; it is noted here so nobody re-discovers the reaction dead end.
+- A **reaction** on a message → `feedback` row of kind `'reaction'`, value = the emoji, against
+  the single paper that message carried. Because a reaction can be taken back, `new_reaction`
+  is treated as the authoritative current set for that user and replaces their previous rows;
+  a taken-back 👎 that stayed counted would silently corrupt the reader ranking.
+- A **reply** beginning with 👍 / 👎 / 🔥 (optionally followed by text) → kind `'rating'`
+  against the resolved paper. Any other free-text reply → stored verbatim as kind `'reply'`; a
+  weekly job extracts preference statements ("more theory", "less benchmark-only work") into
+  `profile.notes`, injected into the review prompt as soft guidance. Human language becomes
+  policy without editing weights by hand.
+
+**An unplaceable reaction is refused, not guessed.** A reaction is attached to a *message*, not
+to a region of one, so a message carrying two papers makes the reaction unattributable. Earlier
+code returned "first by rank", silently crediting every reaction on a two-paper message to
+whichever paper ranked higher — an invisible corruption of exactly the ranking
+`most rated papers by users` is built on. Attribution now returns nothing when a message holds
+more than one paper, logs `feedback.ambiguous_message` with the candidates, and drops the
+update. Dropping is recoverable; misfiling is not. §8.4 removes the cause.
 
 **Impact calibration is no longer a separate weekly job.** An earlier draft refreshed
 citations/stars/upvotes for picks from 1/3/6/12 months ago in one weekly batch. That is
@@ -917,15 +1039,34 @@ good?" and never "what did we miss?". `screener revisit --calibrate` renders the
 the weekly job used to produce, plus the false-negative audit and the digest-lift
 estimate that it could not.
 
+### 8.4 One paper per message
+
+The digest used to pack up to five items per message. In the live database **four of five
+messages carried two papers**, which made the majority of reader reactions unplaceable — and
+the same ambiguity applied to a reply, since quoting a message quotes all of it.
+
+**One paper per message, therefore, is an attribution requirement rather than a formatting
+choice.** It makes a rating identify a paper by construction, for reactions and replies alike,
+and it is asserted in code (`test_no_message_ever_carries_two_papers`) rather than assumed. The
+cost is a burst of messages in the chat, which `disable_notification` on all but the first
+keeps from becoming a burst of notifications.
+
+Historical rows are unaffected and remain readable: the four two-paper messages predate the
+change, and their reactions were never captured. Nothing needs migrating — the constraint binds
+new digests.
+
 ---
 
 ## 9. Telegram adapter details
 
 - Send: `POST /bot{token}/sendMessage` with `chat_id`, `text`, `parse_mode=HTML`,
   `link_preview_options.is_disabled=true`, retry on 429 honouring `retry_after`.
-- Feedback polling: `POST /bot{token}/getUpdates` with `allowed_updates=["message"]` and
-  an offset persisted in `kv_state` so each update is consumed exactly once. No
-  `message_reaction` — it cannot fire in a private chat (§8.3).
+- Sending also sets `disable_notification=true` on every message after the first (§8.2), so a
+  multi-message digest still announces itself once.
+- Feedback polling: `POST /bot{token}/getUpdates` with
+  `allowed_updates=["message", "message_reaction"]` and an offset persisted in `kv_state` so
+  each update is consumed exactly once. Reaction updates arrive only once the bot is an
+  administrator of the group (§8.3).
 - Idempotency: message ids are persisted with `(arxiv_id, version, kind)` behind the
   `delivered_once` partial index (§10), so a re-run after a crash cannot double-post.
 - Failure: after retries, the rendered digest is written to `outbox/{date}.html` and a
@@ -1544,7 +1685,7 @@ see it.
 
 | Failure | Detection | Response |
 |---|---|---|
-| arXiv API down / slow | timeout or 5xx on all queries | retry w/ backoff; if still failing, **skip the day with a one-line notice** ("no digest: source unavailable") — silence must not be ambiguous |
+| arXiv API down / slow | timeout or 5xx on all queries | retry w/ backoff, then per-category isolation: **one dead category must not lose the seven that worked**. A total outage raises `SourceUnavailable`, and the run ends with status `failed`, a heartbeat failure, and a one-line notice to the reader ("no digest today — source unavailable"). The first real outage produced a ten-minute run and a 200-line traceback instead; the fetch now also carries a wall-clock budget after which it returns what it has, because a digest from six categories beats one that never finishes |
 | arXiv returns empty window | 0 results after gate | send nothing; log `empty` status. Never fabricate content |
 | LLM provider outage | circuit breaker on the parse client | fall back to the secondary provider; else **degraded digest**: metadata + abstract quotes, clearly labelled "auto-summary unavailable" |
 | LLM returns invalid JSON | Pydantic validation error | one repair retry with the error appended; second failure drops the paper |
@@ -1855,6 +1996,13 @@ features and evidence; the policy stays in versioned config that a person approv
   a ToU violation, not just a slowdown. Also: one fetch per query per day (the API asks for
   caching, and `updated` only changes at midnight), `max_results` ≤ 2000 per slice, prefer
   `export.arxiv.org` (not the main site), OAI-PMH only if bulk need arises.
+- **Request count is the real rate-limit lever, and caching is mandatory.** Measured: at
+  `max_results=100` per page the 5-day, 8-category window costs ~30 requests; at 1000 it costs
+  **10**. arXiv rate-limits by request, and a day of debugging produced a sustained 429/503
+  storm from our own traffic. The ToU's "no need to call more than once a day — please cache" is
+  therefore implemented literally: raw per-category results are cached for the calendar day
+  (`updated` only changes at midnight), which took a repeat fetch from 33 s to 0.07 s. Adaptive
+  backoff doubles the inter-request interval on a 429 and honours `Retry-After`.
 - **arXiv metadata is CC0.** Per the same ToU, descriptive metadata (title, abstract,
   authors, identifiers, categories) is released under CC0, so storing, transforming and
   sharing it is explicitly permitted. E-print *content* is not — which is exactly the line
@@ -1887,26 +2035,17 @@ because labels cannot be collected retroactively (§2, principle 7). The rung is
 deliberately the cheapest part of §6.6 to build; everything else in that section can wait,
 the enrolment cannot.
 
-**v1 — the product (3–5 days).** Triage cascade, full rubric + deterministic ranker,
-faithfulness verifier, style lint, HTML digest format, `dry-run`/`replay`, eval fixture
-set, soft budget cap, heartbeat, text-emoji feedback capture. The T+14 rung has been
-accumulating labels since v0.
+**v1 — the T+14 rating.** *Moved forward from v1.5 by decision 9:* a rating grounded in
+measured evidence is only possible with the signals, so enrichment (Semantic Scholar citations
+and venue, GitHub stars, HF upvotes) is part of the core path rather than an optional tier. The
+rubric gains its measured half, and every digest item prints its basis (§7.3). Without this the
+product is the T+0 forecast this design set out to replace.
 
-**No enrichment yet, and that is fine.** Enrichment stays in v1.5 as originally planned,
-but two rubric dimensions (`pedigree`, `early_signal`) depend on it. Rather than drag
-stage 3 forward or silently score them 0, v1 marks both `None` and **renormalises the
-composite over the six observable dimensions** (§6.5). This is the same missing-signal
-rule the maturity loop uses (§6.6.3), and it is covered by a test (§13.3). The weights
-simply span 6 dimensions at v1 and 8 from v1.5 — a config-driven change with no refactor.
-
-**v1.5 — depth + the maturity loop.** Enrichment (S2/OpenAlex/HF/GitHub) behind the
-existing `Enricher` port, full-text tier for finalists, weekly recap mode, **the T+90 and
-T+180 rungs, the calibration reports, the false-negative audit, and `screener revisit` as
-its own systemd timer.** The `watchlist`/`outcomes` tables and the probe adapter are *not*
-new here — v0 already ships them in minimal form (stars and upvotes only), because the
-T+14 rung cannot be collected retroactively. What v1.5 adds is the rest of the ladder and
-everything that reads it. T+90 rungs from v0 enrolment are maturing around now, which is
-the first point at which `impact_forecast` can be judged at all rather than asserted.
+**v1.5 — depth + the maturity loop.** Full-text tier for finalists, weekly recap mode, **the
+T+90 and T+180 rungs, the calibration reports, the false-negative audit, and `screener revisit`
+as its own systemd timer.** The `watchlist`/`outcomes` tables and the probe adapter are not new
+here — they exist already. What v1.5 adds is the rest of the ladder, which is what turns the
+quality half of the rating into something measurable.
 
 **v2 — calibration-driven tuning + personalization.** Weight/threshold/gate proposals
 derived from matured rungs, shipped through `replay` and human review (§6.6.4, §13.5);
@@ -1920,6 +2059,69 @@ Markdown/HTML archive, multi-field profiles.
 
 ---
 
+## 17. Web UI — browsing what was found, sent and rated
+
+A localhost-only, read-only view over `screener.db` (`screener web`, §17.1). It exists for the
+question the digest cannot answer: *what has this thing been doing?* — which papers went out on
+which day, what the funnel looked like, and what readers did with it.
+
+### 17.1 Two hard constraints
+
+| Constraint | Why |
+|---|---|
+| **Read-only** | Every connection opens with SQLite's `mode=ro`. The UI has no write path at all, so browsing cannot corrupt the store the pipeline depends on. It also never migrates: a database below the required schema version is reported as needing `screener stats` (or any pipeline command) rather than being silently upgraded by a viewer. |
+| **Localhost only** | There is no authentication, so exposure *is* the security boundary. The default bind is `127.0.0.1`, and a non-loopback address is refused unless `--allow-remote` is passed explicitly — the failure mode of an accidentally-public digest history is worse than the inconvenience of an SSH tunnel. |
+
+Server-rendered Jinja2 with no JavaScript and no build step: the pages work with scripting off,
+and there is nothing to compile before reading them.
+
+### 17.2 The views
+
+| Route | Question it answers |
+|---|---|
+| `/` | Overall statistics: papers fetched, gate pass rate, delivered count, spend, run-status breakdown, readers leaderboard, per-day digest table, and a per-run funnel |
+| `/days`, `/day/{date}` | What was delivered on one day, item by item, with each paper's review prose, basis table and reactions; plus that day's runs, funnel and notes |
+| `/papers` | Delivered papers over a selectable period, searchable by title, abstract or id |
+| `/top?by=score` | Papers **we** rated highest in the period |
+| `/top?by=users` | Papers **readers** rated highest in the period |
+| `/reactions` | Every reaction and reply, per user and per emoji, with the most-rated papers |
+| `/paper/{id}` | One paper's full history: rating arithmetic, measured signals, watchlist, outcome rungs, review, delivery, readers |
+
+### 17.3 Where the views get their numbers
+
+Three decisions that would otherwise produce quietly wrong pages:
+
+1. **Days come from `substr(ts, 1, 10)`, not `date(ts)`.** Timestamps are stored with the local
+   UTC offset, and SQLite's `date()` normalises to UTC — so a run at 02:00 local would be filed
+   under the previous day. The string prefix is the local date as recorded, which is what a
+   reader means by "that day".
+2. **Assessments are joined per `run_id`.** Re-arming and re-running reviews the same paper
+   again under a new run, and the schema permits that. Without the run filter the join multiplied
+   every item: in the live database one paper appeared three times on its day page.
+3. **A reader score is `CASE value WHEN …`, weighted by emoji**, not a count. One 🔥 is a stronger
+   signal than one 👍, and a 👎 subtracts. `users` counts *distinct people*, because three
+   reactions from one enthusiast is not three readers agreeing.
+
+### 17.4 Reader reactions (§8.3)
+
+Both mechanisms are live and both are stored per user: a **written reply** quoting a digest
+message, and an **emoji reaction** on it. Both resolve to a paper through `deliveries`, which is
+the only record of which chunk carried which item.
+
+One measured constraint: Telegram delivers `message_reaction` updates **only when the bot is an
+administrator** of the chat. The subscription is enabled regardless, so reactions begin flowing
+the moment the bot is promoted and no code changes then. Until it is, the page says so
+explicitly rather than looking broken, and replies are captured either way.
+
+Because a reaction can be taken back, `new_reaction` is treated as the authoritative current set
+for that user: each update replaces that user's prior reaction on the message. A taken-back 👎
+that stayed counted would silently corrupt the reader ranking.
+
+**Storage.** `feedback` is keyed `(message_id, arxiv_id, kind, value, tg_user_id)` (migration
+002). The v1 key omitted the user, so it could not distinguish three readers giving the same 👍
+and could not undo one of them. `tg_user_id` is `NOT NULL DEFAULT 0` because SQLite treats NULLs
+as distinct in a primary key, which would defeat the uniqueness; 0 means "unknown".
+
 ## 16. Decisions
 
 Confirmed by the product owner (these are the defaults the design is built on):
@@ -1929,11 +2131,13 @@ Confirmed by the product owner (these are the defaults the design is built on):
 | 1 | LLM tiering | **Balanced**, on **DeepSeek**: `deepseek-flash` for both tiers at v0 (added in review: was provider-agnostic) | `llm_fast` / `llm_deep` are two configured models behind one `LLM` port. The adapter speaks OpenAI-shaped chat-completions, which DeepSeek serves at `https://api.deepseek.com`. One model serves both tiers at v0; v1 can split them to `deepseek-flash` (triage) + `deepseek-v4-pro` (review) with no code change |
 | 2 | Deployment host | **Linux host, via systemd timers** (revised in review: was "this Mac, via launchd") | SQLite stays a local file. `Persistent=true` on every timer gives the missed-job self-healing that launchd's coalescing did; `doctor` becomes a weekly timer. The revision is because the project lives on Linux/WSL2 where `launchctl` and `pmset` do not exist — plists could not be tested (§12.5). macOS units become a later port, not the target |
 | 3 | Topic scope | **LLM/agentic systems only** | Negative examples for classical MAS/MARL and agent-based simulation are mandatory in both the gate and the triage prompt |
-| 4 | Digest shape | **3–6 quality-gated picks, ~900 chars each; 0 is acceptable** | `selection.max_papers = 6`, `selection.min_score = 6.5`, `selection.per_topic_cap = 2` — all in the `selection` block, which is their single home; §5 states explicitly that `per_topic_cap` is *not* a profile key |
+| 4 | Digest shape | **3–6 quality-gated picks, ~900 chars each; 0 is acceptable** | `selection.max_papers = 6`, `selection.per_topic_cap = 2`, and `min_score = 5.5` — calibrated down from 6.5 after measurement showed 6.5 admitted 0–2 of 16 reviewed papers (§6.6.7) — all in the `selection` block, which is their single home; §5 states explicitly that `per_topic_cap` is *not* a profile key |
 | 5 | Full-text review | Deferred to v1.5 (top 8 only) | v1 reviews abstracts; `review.py` accepts an optional `full_text` field from day one so the tier drops in without refactoring |
 | 6 | Summary language | English (papers are English) | One generation pass; a `language` config key exists for later |
 | 7 | Long-horizon promise check | **Enrol every gate-passing paper; measure at T+14 / T+90 / T+180** (added in review) | New `watchlist`/`outcomes`/`revisits`/`calibration` tables, an `ImpactProbe` port, `screener revisit` as a separate daily job, `config/outcome_scale.yaml`, and `matured_impact` labels that feed calibration — never the day-0 score (§6.6) |
 | 8 | What the loop is allowed to change | **Calibration always; resurfacing only under a bounded, dated rule** (added in review) | Digest identity stays "new papers": ≤ 1 resurfaced item per digest, 3 per week, always carrying its original announcement date, outranked by new papers (§6.6.5) |
+| 9 | **Rating point** | **T+14, not T+0** (added in review) | The digest ranks the cohort that just reached T+14 (§5.2), so citations, repo stars and venue are measured rather than forecast. Consequences: `enrich` moves from v1.5 into the core path, `impact_forecast` is replaced by `citation_signal`/`repo_signal`/`venue_signal` (§6.1), and every item prints its basis (§7.3). The digest is deliberately a fortnight behind the firehose |
+| 10 | **Delivery target and reactions** | Delivery is to a **group** (`ai_papers`), not a personal chat | §8.3 called reactions impossible because it assumed the digest went to a 1:1 DM, where a bot cannot be an administrator. The deployment is a group, so reactions are available once the bot is promoted — verified against the live API, which delivered zero reaction updates while it remained a plain member. Consequences: `allowed_updates` includes `message_reaction`; **one paper per message** (§8.4) so a reaction identifies a paper; and an unplaceable reaction is refused rather than guessed |
 
 ### Toolchain prerequisites (verified in this environment)
 
